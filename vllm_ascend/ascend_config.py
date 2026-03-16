@@ -47,6 +47,8 @@ class AscendConfig:
 
         eplb_config = additional_config.get("eplb_config", {})
         self.eplb_config = EplbConfig(eplb_config)
+        spec_decode_config = additional_config.get("ascend_spec_decode_config", {})
+        self.spec_decode_config = AscendSpecDecodeConfig(spec_decode_config)
 
         # Dump / PrecisionDebugger configuration
         self.dump_config_path = additional_config.get("dump_config_path", None)
@@ -248,6 +250,26 @@ class FinegrainedTPConfig:
                 raise AssertionError("module tp sizes must divide data_parallel_size")
         if any(size > 0 for size in module_tp_sizes) and enabled_configs:
             logger.info(f"finegrained_tp_config enabled: {', '.join(enabled_configs)}")
+
+
+class AscendSpecDecodeConfig:
+    """Configuration object for Ascend speculative-decoding specific options."""
+
+    def __init__(self, config: dict):
+        self.ngram_dynamic_gating = config.get("ngram_dynamic_gating", True)
+        self.ngram_gate_probe_window = config.get("ngram_gate_probe_window", 256)
+        self.ngram_gate_min_occurrences = config.get("ngram_gate_min_occurrences", 1)
+
+        if self.ngram_gate_probe_window <= 0:
+            raise ValueError(
+                "ngram_gate_probe_window must be greater than 0; "
+                f"got {self.ngram_gate_probe_window} instead"
+            )
+        if self.ngram_gate_min_occurrences <= 0:
+            raise ValueError(
+                "ngram_gate_min_occurrences must be greater than 0; "
+                f"got {self.ngram_gate_min_occurrences} instead"
+            )
 
 
 class AscendCompilationConfig:

@@ -39,6 +39,9 @@ class TestAscendConfig(TestBase):
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertFalse(ascend_config.multistream_overlap_shared_expert)
         self.assertFalse(ascend_config.enable_kv_nz)
+        self.assertTrue(ascend_config.spec_decode_config.ngram_dynamic_gating)
+        self.assertEqual(ascend_config.spec_decode_config.ngram_gate_probe_window, 256)
+        self.assertEqual(ascend_config.spec_decode_config.ngram_gate_min_occurrences, 1)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
@@ -59,12 +62,20 @@ class TestAscendConfig(TestBase):
             },
             "multistream_overlap_shared_expert": True,
             "eplb_config": {"num_redundant_experts": 2},
+            "ascend_spec_decode_config": {
+                "ngram_dynamic_gating": False,
+                "ngram_gate_probe_window": 128,
+                "ngram_gate_min_occurrences": 2,
+            },
             "refresh": True,
             "enable_kv_nz": False,
         }
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertEqual(ascend_config.eplb_config.num_redundant_experts, 2)
         self.assertTrue(ascend_config.multistream_overlap_shared_expert)
+        self.assertFalse(ascend_config.spec_decode_config.ngram_dynamic_gating)
+        self.assertEqual(ascend_config.spec_decode_config.ngram_gate_probe_window, 128)
+        self.assertEqual(ascend_config.spec_decode_config.ngram_gate_min_occurrences, 2)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertFalse(ascend_compilation_config.fuse_norm_quant)
