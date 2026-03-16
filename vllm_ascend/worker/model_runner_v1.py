@@ -971,6 +971,18 @@ class NPUModelRunner(GPUModelRunner):
         )
 
     # TODO: Once the PCP features are complete, it will fully inherit the classes from the VLLM community.
+    def propose_ngram_draft_token_ids(
+        self,
+        sampled_token_ids: list[list[int]],
+    ) -> list[list[int]]:
+        assert isinstance(self.drafter, AscendNgramProposer)
+        return self.drafter.propose(
+            sampled_token_ids,
+            self.input_batch.num_tokens_no_spec,
+            self.input_batch.token_ids_cpu,
+        )
+
+    # TODO: Once the PCP features are complete, it will fully inherit the classes from the VLLM community.
     def propose_draft_token_ids(
         self,
         valid_sampled_token_ids: torch.Tensor | list[list[int]],
@@ -987,7 +999,12 @@ class NPUModelRunner(GPUModelRunner):
         if not self.drafter:
             # Speculative decoding is not enabled.
             draft_token_ids = None
-        elif isinstance(self.drafter, (AscendNgramProposer, AscendSuffixDecodingProposer)):
+        elif isinstance(self.drafter, AscendNgramProposer):
+            assert isinstance(valid_sampled_token_ids, list)
+            draft_token_ids = self.propose_ngram_draft_token_ids(
+                valid_sampled_token_ids
+            )
+        elif isinstance(self.drafter, AscendSuffixDecodingProposer):
             draft_token_ids = self.drafter.propose(valid_sampled_token_ids)
         elif isinstance(self.drafter, AscendMedusaProposer):
             draft_token_ids = self.drafter.propose(
@@ -1668,15 +1685,20 @@ class NPUModelRunner(GPUModelRunner):
         logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
         cu_num_tokens: list[int] | None = None
+        sampled_token_ids_cpu: torch.Tensor | None = None
+        discard_req_indices_set: set[int] = set()
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
             if max_gen_len == 1:
                 # No spec decode tokens.
-                valid_sampled_token_ids = self._to_list(sampled_token_ids)
-                # Mask out the sampled tokens that should not be sampled.
-                for i in discard_sampled_tokens_req_indices:
-                    valid_sampled_token_ids[int(i)].clear()
+                sampled_token_ids_cpu = self._copy_sampled_token_ids_to_cpu_tensor(
+                    sampled_token_ids
+                )
+                discard_req_indices_set = {
+                    int(i) for i in discard_sampled_tokens_req_indices.tolist()
+                }
+                valid_sampled_token_ids = [[] for _ in range(num_sampled_tokens)]
             else:
                 # Includes spec decode tokens.
                 valid_sampled_token_ids, cu_num_tokens = RejectionSampler.parse_output(
@@ -1710,6 +1732,12 @@ class NPUModelRunner(GPUModelRunner):
         for req_idx in range(num_sampled_tokens):
             if self.use_async_scheduling:
                 sampled_ids = [-1] if req_idx not in invalid_req_indices_set else None
+            elif sampled_token_ids_cpu is not None:
+                if req_idx in discard_req_indices_set:
+                    sampled_ids = []
+                else:
+                    sampled_ids = [int(sampled_token_ids_cpu[req_idx, 0])]
+                    valid_sampled_token_ids[req_idx] = sampled_ids
             else:
                 sampled_ids = valid_sampled_token_ids[req_idx]
 
