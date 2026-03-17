@@ -244,21 +244,55 @@ class NgramProposer(VllmNgramProposer, Proposer):
                            aux_hidden_states=None) -> list[list[int]]:
         num_tokens_no_spec = self.runner.input_batch.num_tokens_no_spec
         token_ids_cpu = self.runner.input_batch.token_ids_cpu
+        req_ids = self.runner.input_batch.req_ids
         valid_ngram_requests = np.empty(len(valid_sampled_token_ids),
                                         dtype=np.int32)
         num_valid_requests = 0
+        non_empty_sampled = 0
+        skipped_max_len = 0
+        adjusted_num_tokens = 0
+        min_num_tokens = self.max_model_len
+        max_num_tokens = 0
 
         for i, sampled_ids in enumerate(valid_sampled_token_ids):
             num_sampled_ids = len(sampled_ids)
             if not num_sampled_ids:
                 continue
+            non_empty_sampled += 1
 
-            num_tokens = num_tokens_no_spec[i]
+            num_tokens = int(num_tokens_no_spec[i])
+            if num_tokens >= self.max_model_len and i < len(req_ids):
+                req_id = req_ids[i]
+                req_state = self.runner.requests.get(req_id)
+                if req_state is not None:
+                    req_state_tokens = int(req_state.num_tokens)
+                    if req_state_tokens < num_tokens:
+                        num_tokens = req_state_tokens
+                        num_tokens_no_spec[i] = req_state_tokens
+                        adjusted_num_tokens += 1
+
+            min_num_tokens = min(min_num_tokens, num_tokens)
+            max_num_tokens = max(max_num_tokens, num_tokens)
             if not self.should_propose_for_request(i, sampled_ids, num_tokens):
+                if num_tokens >= self.max_model_len:
+                    skipped_max_len += 1
                 continue
 
             valid_ngram_requests[num_valid_requests] = i
             num_valid_requests += 1
+
+        if non_empty_sampled > 0 and num_valid_requests == 0:
+            logger.warning(
+                "ASCEND_NGRAM_VALIDATION_EMPTY sampled=%d skipped_max_len=%d "
+                "adjusted_num_tokens=%d min_num_tokens=%d max_num_tokens=%d "
+                "max_model_len=%d",
+                non_empty_sampled,
+                skipped_max_len,
+                adjusted_num_tokens,
+                min_num_tokens,
+                max_num_tokens,
+                self.max_model_len,
+            )
 
         return self.batch_propose(
             len(valid_sampled_token_ids),
