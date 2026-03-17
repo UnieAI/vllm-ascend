@@ -57,6 +57,9 @@ class NgramProposer(VllmNgramProposer, Proposer):
                 1, self.num_numba_thread_available // max(1, tp_size))
         else:
             self.num_numba_thread_available = 1
+        self.match_log_interval = int(
+            os.environ.get("VLLM_ASCEND_NGRAM_MATCH_LOG_INTERVAL", "50"))
+        self.match_log_steps = 0
 
         warmup_num_reqs = min(8, max_num_seqs)
         warmup_model_len = min(
@@ -175,6 +178,27 @@ class NgramProposer(VllmNgramProposer, Proposer):
             num_tokens_no_spec,
             token_ids_cpu,
         )
+        self.match_log_steps += 1
+        should_log = self.match_log_steps <= 5
+        if self.match_log_interval > 0 and \
+                self.match_log_steps % self.match_log_interval == 0:
+            should_log = True
+        if should_log:
+            if len(valid_ngram_requests) > 0:
+                matched_drafts = self.valid_ngram_num_drafts[valid_ngram_requests]
+                matched_reqs = int((matched_drafts > 0).sum())
+                total_draft_tokens = int(matched_drafts.sum(dtype=np.int64))
+            else:
+                matched_reqs = 0
+                total_draft_tokens = 0
+            logger.warning(
+                "ASCEND_NGRAM_MATCH_STATS step=%d valid_reqs=%d "
+                "matched_reqs=%d total_draft_tokens=%d",
+                self.match_log_steps,
+                len(valid_ngram_requests),
+                matched_reqs,
+                total_draft_tokens,
+            )
         return self.materialize_draft_token_ids(
             num_requests,
             valid_ngram_requests,
