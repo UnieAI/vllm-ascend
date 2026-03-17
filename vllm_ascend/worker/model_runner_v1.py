@@ -2112,6 +2112,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
             num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
             sampled_token_ids = sampler_output.sampled_token_ids
+            require_valid_sampled_token_ids_for_proposer = (
+                self.use_async_scheduling and self.speculative_config is not None
+                and self.drafter is not None
+                and self.drafter.name == SpecDcodeType.NGRAM)
             if not self.use_async_scheduling:
                 # Get the valid generated tokens.
                 max_gen_len = sampled_token_ids.shape[-1]
@@ -2128,16 +2132,42 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 for i in discard_sampled_tokens_req_indices:
                     valid_sampled_token_ids[i].clear()
             else:
-                valid_sampled_token_ids = []
                 invalid_req_indices = list(discard_sampled_tokens_req_indices)
                 invalid_req_indices_set = set(invalid_req_indices)
-                assert sampled_token_ids.shape[-1] == 1
+                if require_valid_sampled_token_ids_for_proposer:
+                    max_gen_len = sampled_token_ids.shape[-1]
+                    if max_gen_len == 1:
+                        valid_sampled_token_ids = sampled_token_ids.tolist()
+                    else:
+                        valid_sampled_token_ids = \
+                            self.rejection_sampler.parse_output(
+                                sampled_token_ids,
+                                self.input_batch.vocab_size,
+                            )
+                    for i in discard_sampled_tokens_req_indices:
+                        valid_sampled_token_ids[i].clear()
+                else:
+                    valid_sampled_token_ids = []
+                    assert sampled_token_ids.shape[-1] == 1
 
                 # Cache the sampled tokens on the NPU and avoid CPU sync.
                 # These will be copied into input_ids in the next step
                 # when preparing inputs.
-                self.input_batch.prev_sampled_token_ids = \
-                    sampled_token_ids
+                if require_valid_sampled_token_ids_for_proposer \
+                        and sampled_token_ids.shape[-1] > 1:
+                    valid_mask = ((sampled_token_ids != -1)
+                                  & (sampled_token_ids
+                                     < self.input_batch.vocab_size))
+                    last_valid_idx = torch.clamp(
+                        valid_mask.sum(dim=1).to(torch.int64) - 1, min=0)
+                    self.input_batch.prev_sampled_token_ids = torch.gather(
+                        sampled_token_ids,
+                        dim=1,
+                        index=last_valid_idx.unsqueeze(1),
+                    )
+                else:
+                    self.input_batch.prev_sampled_token_ids = \
+                        sampled_token_ids
                 self.input_batch.prev_sampled_token_ids_invalid_indices = \
                     invalid_req_indices_set
                 self.input_batch.prev_req_id_to_index = {
@@ -2152,8 +2182,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # between the first-stage worker and the last-stage worker.
             for req_idx in range(num_sampled_tokens):
                 if self.use_async_scheduling:
-                    sampled_ids = [-1] * 1 if \
-                        req_idx not in invalid_req_indices_set else None
+                    if require_valid_sampled_token_ids_for_proposer:
+                        sampled_ids = valid_sampled_token_ids[req_idx]
+                    else:
+                        sampled_ids = [-1] * 1 if \
+                            req_idx not in invalid_req_indices_set else None
                 else:
                     sampled_ids = valid_sampled_token_ids[req_idx]
                 if not sampled_ids:

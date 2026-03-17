@@ -213,3 +213,24 @@ def test_ascend_ngram_proposer_works_without_input_batch_in_runner():
         token_ids_cpu=token_ids_cpu,
     )
     assert result == [[3, 1], [6, 4]]
+
+
+def test_ascend_ngram_generate_token_ids_does_not_rewrite_token_ids_cpu():
+    proposer = _make_ngram_proposer(
+        num_req=1,
+        min_n=2,
+        max_n=2,
+        k=2,
+        max_model_len=20,
+    )
+    token_ids_cpu = np.zeros((1, 20), dtype=np.int32)
+    token_ids_cpu[0, :7] = [1, 2, 3, 1, 2, 3, 1]
+    input_batch = proposer.runner.input_batch
+    input_batch.token_ids_cpu = token_ids_cpu
+    input_batch.num_tokens_no_spec = np.array([7], dtype=np.int32)
+
+    token_ids_before = token_ids_cpu.copy()
+    result = proposer.generate_token_ids(valid_sampled_token_ids=[[3, 1]])
+
+    np.testing.assert_array_equal(token_ids_cpu, token_ids_before)
+    assert result == [[2, 3]]

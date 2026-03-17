@@ -230,9 +230,6 @@ class NgramProposer(VllmNgramProposer, Proposer):
             if not self.should_propose_for_request(i, sampled_ids, num_tokens):
                 continue
 
-            start_idx = num_tokens
-            end_idx = start_idx + num_sampled_ids
-            token_ids_cpu[i, start_idx:end_idx] = sampled_ids
             valid_ngram_requests[num_valid_requests] = i
             num_valid_requests += 1
 
