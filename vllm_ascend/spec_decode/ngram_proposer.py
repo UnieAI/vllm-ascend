@@ -169,10 +169,19 @@ class NgramProposer(VllmNgramProposer, Proposer):
                     i, :self.valid_ngram_num_drafts[i]].tolist()
         return draft_token_ids
 
+    def _ensure_match_log_state(self) -> None:
+        # Guard against partial init paths where match-log fields are missing.
+        if not hasattr(self, "match_log_interval"):
+            self.match_log_interval = int(
+                os.environ.get("VLLM_ASCEND_NGRAM_MATCH_LOG_INTERVAL", "50"))
+        if not hasattr(self, "match_log_steps"):
+            self.match_log_steps = 0
+
     def batch_propose(self, num_requests: int,
                       valid_ngram_requests: np.ndarray,
                       num_tokens_no_spec: np.ndarray,
                       token_ids_cpu: np.ndarray) -> list[list[int]]:
+        self._ensure_match_log_state()
         self.run_batch_match(
             valid_ngram_requests,
             num_tokens_no_spec,
