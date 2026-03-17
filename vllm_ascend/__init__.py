@@ -15,9 +15,20 @@
 # This file is a part of the vllm-ascend project.
 #
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+_REGISTER_LOGGED = False
+
 
 def register():
     """Register the NPU platform."""
+    global _REGISTER_LOGGED
+    if not _REGISTER_LOGGED:
+        logger.info(
+            "vllm-ascend platform plugin activated; using "
+            "vllm_ascend.platform.NPUPlatform")
+        _REGISTER_LOGGED = True
 
     return "vllm_ascend.platform.NPUPlatform"
 

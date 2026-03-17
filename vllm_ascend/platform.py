@@ -64,6 +64,9 @@ class NPUPlatform(Platform):
                                 parser: Optional[FlexibleArgumentParser] = None
                                 ) -> None:
         # Adapt the global patch here.
+        logger.info(
+            "vllm-ascend pre_register_and_update starting global patch "
+            "adaptation")
         from vllm_ascend.utils import adapt_patch
         adapt_patch(is_global_patch=True)
 
