@@ -186,3 +186,30 @@ def test_ascend_ngram_get_valid_requests_returns_numpy_indices():
         num_tokens_no_spec=np.array([4, 4, 4, 1024], dtype=np.int32),
     )
     np.testing.assert_array_equal(valid, np.array([0], dtype=np.int32))
+
+
+def test_ascend_ngram_proposer_works_without_input_batch_in_runner():
+    proposer = NgramProposer(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=20),
+            parallel_config=SimpleNamespace(tensor_parallel_size=1),
+            scheduler_config=SimpleNamespace(max_num_seqs=2),
+            speculative_config=SimpleNamespace(
+                prompt_lookup_min=2,
+                prompt_lookup_max=2,
+                num_speculative_tokens=2,
+                method="ngram",
+            ),
+        ),
+        device="cpu",
+        runner=SimpleNamespace(),
+    )
+    token_ids_cpu = np.zeros((2, 20), dtype=np.int32)
+    token_ids_cpu[0, :5] = [1, 2, 3, 1, 2]
+    token_ids_cpu[1, :5] = [4, 5, 6, 4, 5]
+    result = proposer.propose(
+        sampled_token_ids=[[2], [5]],
+        num_tokens_no_spec=np.array([5, 5], dtype=np.int32),
+        token_ids_cpu=token_ids_cpu,
+    )
+    assert result == [[3, 1], [6, 4]]

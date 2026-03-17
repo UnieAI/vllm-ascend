@@ -60,10 +60,13 @@ class NgramProposer(VllmNgramProposer, Proposer):
             self.max_model_len,
             max(64, self.max_n + self.k, self.min_n + self.k),
         )
+        warmup_valid_ngram_requests = np.arange(warmup_num_reqs,
+                                                dtype=np.int32)
         self.propose(
             [[0]] * warmup_num_reqs,
             np.full(warmup_num_reqs, warmup_model_len, dtype=np.int32),
             np.zeros((warmup_num_reqs, warmup_model_len), dtype=np.int32),
+            valid_ngram_requests=warmup_valid_ngram_requests,
         )
 
     def load_model(self, *args, **kwargs):
@@ -94,10 +97,25 @@ class NgramProposer(VllmNgramProposer, Proposer):
 
     def get_valid_ngram_requests(self, sampled_token_ids: list[list[int]],
                                  num_tokens_no_spec: np.ndarray) -> np.ndarray:
+        input_batch = getattr(self.runner, "input_batch", None)
+        if input_batch is None:
+            # Input batch may be initialized after drafter construction.
+            valid_ngram_requests = np.empty(len(sampled_token_ids),
+                                            dtype=np.int32)
+            num_valid_requests = 0
+            for i, sampled_ids in enumerate(sampled_token_ids):
+                if not sampled_ids:
+                    continue
+                if num_tokens_no_spec[i] >= self.max_model_len:
+                    continue
+                valid_ngram_requests[num_valid_requests] = i
+                num_valid_requests += 1
+            return valid_ngram_requests[:num_valid_requests]
+
         valid_ngram_requests = np.empty(len(sampled_token_ids), dtype=np.int32)
         num_valid_requests = 0
-        req_ids = self.runner.input_batch.req_ids
-        unsupported_reqs = self.runner.input_batch.spec_decode_unsupported_reqs
+        req_ids = input_batch.req_ids
+        unsupported_reqs = input_batch.spec_decode_unsupported_reqs
         has_unsupported_reqs = bool(unsupported_reqs)
 
         for i, sampled_ids in enumerate(sampled_token_ids):
