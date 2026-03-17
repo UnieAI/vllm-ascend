@@ -971,15 +971,51 @@ class NPUModelRunner(GPUModelRunner):
         )
 
     # TODO: Once the PCP features are complete, it will fully inherit the classes from the VLLM community.
+    def get_ngram_proposal_inputs(
+        self,
+        sampled_token_ids: list[list[int]],
+    ) -> "AscendNgramProposalInputs":
+        from vllm_ascend.spec_decode.ngram_proposer import (
+            AscendNgramProposalInputs,
+            AscendNgramProposer,
+        )
+
+        assert isinstance(self.drafter, AscendNgramProposer)
+
+        valid_ngram_requests = np.empty(len(sampled_token_ids), dtype=np.int32)
+        num_valid_requests = 0
+        req_ids = self.input_batch.req_ids
+        unsupported_reqs = self.input_batch.spec_decode_unsupported_reqs
+        has_unsupported_reqs = bool(unsupported_reqs)
+        for i, sampled_ids in enumerate(sampled_token_ids):
+            if not sampled_ids:
+                continue
+            if self.input_batch.num_tokens_no_spec[i] >= self.drafter.max_model_len:
+                continue
+            if has_unsupported_reqs and req_ids[i] in unsupported_reqs:
+                continue
+            valid_ngram_requests[num_valid_requests] = i
+            num_valid_requests += 1
+
+        return AscendNgramProposalInputs(
+            sampled_token_ids=sampled_token_ids,
+            num_tokens_no_spec=self.input_batch.num_tokens_no_spec,
+            token_ids_cpu=self.input_batch.token_ids_cpu,
+            valid_ngram_requests=valid_ngram_requests[:num_valid_requests],
+        )
+
+    # TODO: Once the PCP features are complete, it will fully inherit the classes from the VLLM community.
     def propose_ngram_draft_token_ids(
         self,
         sampled_token_ids: list[list[int]],
     ) -> list[list[int]]:
         assert isinstance(self.drafter, AscendNgramProposer)
+        ngram_inputs = self.get_ngram_proposal_inputs(sampled_token_ids)
         return self.drafter.propose(
-            sampled_token_ids,
-            self.input_batch.num_tokens_no_spec,
-            self.input_batch.token_ids_cpu,
+            ngram_inputs.sampled_token_ids,
+            ngram_inputs.num_tokens_no_spec,
+            ngram_inputs.token_ids_cpu,
+            valid_ngram_requests=ngram_inputs.valid_ngram_requests,
         )
 
     # TODO: Once the PCP features are complete, it will fully inherit the classes from the VLLM community.
