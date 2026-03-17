@@ -71,7 +71,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
             np.zeros((warmup_num_reqs, warmup_model_len), dtype=np.int32),
             valid_ngram_requests=warmup_valid_ngram_requests,
         )
-        logger.info(
+        logger.warning(
             "ASCEND_NGRAM_STARTUP_MARKER file=%s min_n=%d max_n=%d "
             "num_spec_tokens=%d search_window=%s max_model_len=%d",
             __file__,

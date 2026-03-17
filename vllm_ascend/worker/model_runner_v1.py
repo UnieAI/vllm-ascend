@@ -344,7 +344,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     self.speculative_config.method, self.vllm_config,
                     self.device, self)
                 if self.speculative_config.method == "ngram":
-                    logger.info(
+                    logger.warning(
                         "ASCEND_NGRAM_RUNTIME_MARKER async_scheduling=%s "
                         "max_num_reqs=%d max_num_tokens=%d",
                         self.scheduler_config.async_scheduling,
@@ -476,6 +476,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self._ngram_accept_log_steps = 0
         self._ngram_total_draft_tokens = 0
         self._ngram_total_accepted_tokens = 0
+        self._ngram_propose_trace_budget = int(
+            os.environ.get("VLLM_ASCEND_NGRAM_PROPOSE_TRACE_BUDGET", "5"))
 
         # NOTE: we need to use `in_profile_run` to determine whether `enable_force_load_balance` is True
         self.in_profile_run = False
@@ -1812,6 +1814,17 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # Speculative decoding is not enabled.
             draft_token_ids = None
         else:
+            if self.drafter.name == SpecDcodeType.NGRAM and \
+                    self._ngram_propose_trace_budget > 0:
+                non_empty_sampled = sum(1 for ids in valid_sampled_token_ids
+                                        if ids)
+                logger.warning(
+                    "ASCEND_NGRAM_PROPOSE_CALL_MARKER non_empty_sampled=%d "
+                    "num_reqs=%d",
+                    non_empty_sampled,
+                    len(valid_sampled_token_ids),
+                )
+                self._ngram_propose_trace_budget -= 1
             draft_token_ids = self.drafter.generate_token_ids(
                 valid_sampled_token_ids, sampling_metadata, scheduler_output,
                 spec_decode_metadata, positions, num_scheduled_tokens,
@@ -1868,7 +1881,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             step_accept_rate = step_accepted_tokens / step_draft_tokens
             total_accept_rate = self._ngram_total_accepted_tokens / \
                 self._ngram_total_draft_tokens
-            logger.info(
+            logger.warning(
                 "ASCEND_NGRAM_ACCEPT_RATE step=%d step_rate=%.4f "
                 "step_accepted=%d step_draft=%d total_rate=%.4f "
                 "total_accepted=%d total_draft=%d",
