@@ -135,6 +135,7 @@ class NPUPlatform(Platform):
         # Adapt the global patch here.
         from vllm_ascend.utils import adapt_patch
 
+        logger.info("vllm-ascend pre_register_and_update starting global patch adaptation")
         adapt_patch(is_global_patch=True)
 
         # For online serving, "ascend" quantization method is not a choice natively,
