@@ -131,7 +131,7 @@ def test_find_longest_matched_ngram_and_propose_tokens():
     )
 
 
-def test_ascend_ngram_proposer_skips_unsupported_requests():
+def test_ascend_ngram_proposer_does_not_filter_unsupported_requests():
     proposer = _make_ngram_proposer(
         num_req=2,
         min_n=2,
@@ -145,7 +145,7 @@ def test_ascend_ngram_proposer_skips_unsupported_requests():
         num_tokens_no_spec=np.array([5, 5], dtype=np.int32),
         token_ids_cpu=token_ids_cpu,
     )
-    assert result[0] == []
+    assert result[0] == [3, 1]
     assert result[1] == [9, 7]
 
 
@@ -167,9 +167,9 @@ def test_ascend_ngram_proposer_non_contiguous_indices():
         num_tokens_no_spec=np.array([5, 5, 5], dtype=np.int32),
         token_ids_cpu=token_ids_cpu,
     )
-    assert result == [[3, 1], [], [9, 7]]
+    assert result == [[3, 1], [6, 4], [9, 7]]
     assert proposer.valid_ngram_num_drafts[0] == 2
-    assert proposer.valid_ngram_num_drafts[1] == 0
+    assert proposer.valid_ngram_num_drafts[1] == 2
     assert proposer.valid_ngram_num_drafts[2] == 2
 
 
@@ -185,7 +185,7 @@ def test_ascend_ngram_get_valid_requests_returns_numpy_indices():
         sampled_token_ids=[[1], [2], [], [3]],
         num_tokens_no_spec=np.array([4, 4, 4, 1024], dtype=np.int32),
     )
-    np.testing.assert_array_equal(valid, np.array([0], dtype=np.int32))
+    np.testing.assert_array_equal(valid, np.array([0, 1], dtype=np.int32))
 
 
 def test_ascend_ngram_proposer_works_without_input_batch_in_runner():
