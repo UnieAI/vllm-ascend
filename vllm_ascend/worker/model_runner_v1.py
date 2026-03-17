@@ -478,6 +478,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self._ngram_total_accepted_tokens = 0
         self._ngram_propose_trace_budget = int(
             os.environ.get("VLLM_ASCEND_NGRAM_PROPOSE_TRACE_BUDGET", "5"))
+        self._ngram_execute_trace_budget = int(
+            os.environ.get("VLLM_ASCEND_NGRAM_EXECUTE_TRACE_BUDGET", "5"))
+        self._ngram_take_draft_trace_budget = int(
+            os.environ.get("VLLM_ASCEND_NGRAM_TAKE_DRAFT_TRACE_BUDGET", "5"))
 
         # NOTE: we need to use `in_profile_run` to determine whether `enable_force_load_balance` is True
         self.in_profile_run = False
@@ -2301,6 +2305,18 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 req_state.output_token_ids.extend(sampled_ids)
 
             if self.speculative_config:
+                if self.drafter is not None and \
+                        self.drafter.name == SpecDcodeType.NGRAM and \
+                        self._ngram_execute_trace_budget > 0:
+                    non_empty_sampled = sum(1 for ids in valid_sampled_token_ids
+                                            if ids)
+                    logger.warning(
+                        "ASCEND_NGRAM_EXECUTE_STEP_MARKER "
+                        "num_sampled_tokens=%d non_empty_sampled=%d",
+                        num_sampled_tokens,
+                        non_empty_sampled,
+                    )
+                    self._ngram_execute_trace_budget -= 1
                 self._maybe_log_ngram_accept_rate(valid_sampled_token_ids,
                                                   spec_decode_metadata)
                 self._draft_token_ids = self.propose_draft_token_ids(
@@ -2359,6 +2375,18 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             draft_token_ids = self._draft_token_ids.tolist()
         else:
             draft_token_ids = self._draft_token_ids
+        if self.drafter is not None and self.drafter.name == SpecDcodeType.NGRAM \
+                and self._ngram_take_draft_trace_budget > 0:
+            non_empty_draft = sum(1 for ids in draft_token_ids if ids)
+            total_draft_tokens = sum(len(ids) for ids in draft_token_ids)
+            logger.warning(
+                "ASCEND_NGRAM_TAKE_DRAFT_MARKER non_empty_draft=%d "
+                "total_draft_tokens=%d num_reqs=%d",
+                non_empty_draft,
+                total_draft_tokens,
+                len(draft_token_ids),
+            )
+            self._ngram_take_draft_trace_budget -= 1
         self._draft_token_ids = None
         return DraftTokenIds(req_ids, draft_token_ids)
 
