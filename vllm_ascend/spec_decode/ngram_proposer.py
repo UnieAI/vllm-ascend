@@ -5,10 +5,13 @@ import numpy as np
 import torch
 from numba import get_num_threads, jit, njit, prange, set_num_threads
 from vllm.config import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.v1.spec_decode.ngram_proposer import \
     NgramProposer as VllmNgramProposer
 
 from vllm_ascend.spec_decode.interface import Proposer, SpecDcodeType
+
+logger = init_logger(__name__)
 
 
 class AscendNgramProposalInputs(NamedTuple):
@@ -67,6 +70,16 @@ class NgramProposer(VllmNgramProposer, Proposer):
             np.full(warmup_num_reqs, warmup_model_len, dtype=np.int32),
             np.zeros((warmup_num_reqs, warmup_model_len), dtype=np.int32),
             valid_ngram_requests=warmup_valid_ngram_requests,
+        )
+        logger.info(
+            "ASCEND_NGRAM_STARTUP_MARKER file=%s min_n=%d max_n=%d "
+            "num_spec_tokens=%d search_window=%s max_model_len=%d",
+            __file__,
+            self.min_n,
+            self.max_n,
+            self.k,
+            str(self.search_window),
+            self.max_model_len,
         )
 
     def load_model(self, *args, **kwargs):

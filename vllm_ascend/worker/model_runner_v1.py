@@ -21,6 +21,7 @@ import copy
 import gc
 import itertools
 import math
+import os
 import re
 import time
 from collections import defaultdict
@@ -342,6 +343,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 self.drafter = get_spec_decode_method(
                     self.speculative_config.method, self.vllm_config,
                     self.device, self)
+                if self.speculative_config.method == "ngram":
+                    logger.info(
+                        "ASCEND_NGRAM_RUNTIME_MARKER async_scheduling=%s "
+                        "max_num_reqs=%d max_num_tokens=%d",
+                        self.scheduler_config.async_scheduling,
+                        self.max_num_reqs,
+                        self.max_num_tokens,
+                    )
                 self.rejection_sampler = AscendRejectionSampler()
             self.actual_seq_lengths_q = list(
                 range(self.decode_token_per_req, self.max_num_tokens + 1,
@@ -462,6 +471,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # Cached outputs.
         self._draft_token_ids: Optional[Union[list[list[int]],
                                               torch.Tensor]] = None
+        self.ngram_accept_log_interval = int(
+            os.environ.get("VLLM_ASCEND_NGRAM_ACCEPT_LOG_INTERVAL", "50"))
+        self._ngram_accept_log_steps = 0
+        self._ngram_total_draft_tokens = 0
+        self._ngram_total_accepted_tokens = 0
 
         # NOTE: we need to use `in_profile_run` to determine whether `enable_force_load_balance` is True
         self.in_profile_run = False
@@ -1804,6 +1818,69 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 hidden_states, attn_metadata, aux_hidden_states)
         return draft_token_ids
 
+    def _parse_rejection_sampler_output(
+            self, output_token_ids: torch.Tensor, vocab_size: int,
+            logprobs_tensors: Optional[LogprobsTensors]
+    ) -> tuple[list[list[int]], Optional[list]]:
+        parsed_output = self.rejection_sampler.parse_output(
+            output_token_ids,
+            vocab_size,
+            logprobs_tensors=logprobs_tensors,
+        )
+        if isinstance(parsed_output, tuple):
+            valid_sampled_token_ids, logprobs_lists = parsed_output
+            return valid_sampled_token_ids, logprobs_lists
+        logprobs_lists = logprobs_tensors.tolists() \
+            if logprobs_tensors is not None else None
+        return parsed_output, logprobs_lists
+
+    def _maybe_log_ngram_accept_rate(
+            self, valid_sampled_token_ids: list[list[int]],
+            spec_decode_metadata: Optional[SpecDecodeMetadata]) -> None:
+        if spec_decode_metadata is None or self.drafter is None \
+                or self.drafter.name != SpecDcodeType.NGRAM:
+            return
+
+        num_draft_tokens = spec_decode_metadata.num_draft_tokens
+        step_draft_tokens = 0
+        step_accepted_tokens = 0
+        for i, num_draft_tokens_for_req in enumerate(num_draft_tokens):
+            if num_draft_tokens_for_req <= 0:
+                continue
+            step_draft_tokens += num_draft_tokens_for_req
+            num_valid_tokens = len(valid_sampled_token_ids[i]) if \
+                i < len(valid_sampled_token_ids) else 0
+            step_accepted_tokens += max(
+                0, min(num_draft_tokens_for_req, num_valid_tokens - 1))
+
+        if step_draft_tokens == 0:
+            return
+
+        self._ngram_total_draft_tokens += step_draft_tokens
+        self._ngram_total_accepted_tokens += step_accepted_tokens
+        self._ngram_accept_log_steps += 1
+
+        should_log = self._ngram_accept_log_steps <= 5
+        if self.ngram_accept_log_interval > 0 and \
+                self._ngram_accept_log_steps % self.ngram_accept_log_interval == 0:
+            should_log = True
+        if should_log:
+            step_accept_rate = step_accepted_tokens / step_draft_tokens
+            total_accept_rate = self._ngram_total_accepted_tokens / \
+                self._ngram_total_draft_tokens
+            logger.info(
+                "ASCEND_NGRAM_ACCEPT_RATE step=%d step_rate=%.4f "
+                "step_accepted=%d step_draft=%d total_rate=%.4f "
+                "total_accepted=%d total_draft=%d",
+                self._ngram_accept_log_steps,
+                step_accept_rate,
+                step_accepted_tokens,
+                step_draft_tokens,
+                total_accept_rate,
+                self._ngram_total_accepted_tokens,
+                self._ngram_total_draft_tokens,
+            )
+
     def _pool(
         self,
         hidden_states: torch.Tensor,
@@ -2098,11 +2175,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             req_id_to_index_output_copy = \
                 self.input_batch.req_id_to_index.copy()
 
-            # NOTE: NPU -> CPU Sync happens here.
-            # Move as many CPU operations as possible before this sync point.
             logprobs_tensors = sampler_output.logprobs_tensors
-            logprobs_lists = logprobs_tensors.tolists() \
-                if logprobs_tensors is not None else None
+            logprobs_lists = None
 
             # Compute prompt logprobs if needed.
             prompt_logprobs_dict = self._get_prompt_logprobs_dict(
@@ -2122,11 +2196,16 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 if max_gen_len == 1:
                     # No spec decode tokens.
                     valid_sampled_token_ids = sampled_token_ids.tolist()
+                    if logprobs_tensors is not None:
+                        # NOTE: NPU -> CPU Sync happens here.
+                        logprobs_lists = logprobs_tensors.tolists()
                 else:
                     # Includes spec decode tokens.
-                    valid_sampled_token_ids = self.rejection_sampler.parse_output(
+                    valid_sampled_token_ids, logprobs_lists = \
+                        self._parse_rejection_sampler_output(
                         sampled_token_ids,
                         self.input_batch.vocab_size,
+                        logprobs_tensors,
                     )
                 # Mask out the sampled tokens that should not be sampled.
                 for i in discard_sampled_tokens_req_indices:
@@ -2139,10 +2218,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     if max_gen_len == 1:
                         valid_sampled_token_ids = sampled_token_ids.tolist()
                     else:
-                        valid_sampled_token_ids = \
-                            self.rejection_sampler.parse_output(
+                        valid_sampled_token_ids, _ = \
+                            self._parse_rejection_sampler_output(
                                 sampled_token_ids,
                                 self.input_batch.vocab_size,
+                                None,
                             )
                     for i in discard_sampled_tokens_req_indices:
                         valid_sampled_token_ids[i].clear()
@@ -2208,6 +2288,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 req_state.output_token_ids.extend(sampled_ids)
 
             if self.speculative_config:
+                self._maybe_log_ngram_accept_rate(valid_sampled_token_ids,
+                                                  spec_decode_metadata)
                 self._draft_token_ids = self.propose_draft_token_ids(
                     valid_sampled_token_ids,
                     sampling_metadata,
