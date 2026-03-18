@@ -3,7 +3,7 @@ from typing import NamedTuple
 
 import numpy as np
 import torch
-from numba import get_num_threads, jit, njit, prange, set_num_threads
+from numba import jit, njit, prange, set_num_threads
 from vllm.config import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.v1.spec_decode.ngram_proposer import \
@@ -51,14 +51,19 @@ class NgramProposer(VllmNgramProposer, Proposer):
         self.num_tokens_threshold = 8192
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         cpu_count = os.cpu_count()
+        max_numba_threads = int(
+            os.environ.get("VLLM_ASCEND_NGRAM_MAX_NUMBA_THREADS", "8"))
+        max_numba_threads = max(1, max_numba_threads)
         if cpu_count:
-            # Align with upstream vLLM default to avoid multi-thread overhead
-            # in decode critical path under moderate request sizes.
-            self.num_numba_thread_available = min(1, max(1, cpu_count // 2))
+            # Use physical cores and cap thread count to avoid starving other
+            # components such as tokenization and structured output handling.
+            self.num_numba_thread_available = min(max_numba_threads,
+                                                  max(1, cpu_count // 2))
             self.num_numba_thread_available = max(
                 1, self.num_numba_thread_available // max(1, tp_size))
         else:
             self.num_numba_thread_available = 1
+        self._numba_threads_in_use = 1
 
         warmup_num_reqs = min(8, max_num_seqs)
         warmup_model_len = min(
@@ -133,16 +138,16 @@ class NgramProposer(VllmNgramProposer, Proposer):
         if not num_ngram_requests:
             return
 
-        original_num_numba_threads = get_num_threads()
         total_tokens = int(np.sum(num_tokens_no_spec, dtype=np.int64))
         if total_tokens >= self.num_tokens_threshold:
-            final_num_threads = max(
+            desired_num_threads = max(
                 1, min(self.num_numba_thread_available, num_ngram_requests))
-            if final_num_threads != original_num_numba_threads:
-                set_num_threads(final_num_threads)
         else:
-            if original_num_numba_threads != 1:
-                set_num_threads(1)
+            desired_num_threads = 1
+
+        if desired_num_threads != self._numba_threads_in_use:
+            set_num_threads(desired_num_threads)
+            self._numba_threads_in_use = desired_num_threads
 
         batch_propose_numba(
             valid_ngram_requests,
@@ -156,8 +161,6 @@ class NgramProposer(VllmNgramProposer, Proposer):
             self.valid_ngram_draft,
             self.valid_ngram_num_drafts,
         )
-        if get_num_threads() != original_num_numba_threads:
-            set_num_threads(original_num_numba_threads)
 
     def materialize_draft_token_ids(
             self, num_requests: int,
