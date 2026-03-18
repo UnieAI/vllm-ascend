@@ -2187,23 +2187,30 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     logits=bonus_logits,
                     sampling_metadata=sampling_metadata,
                 )
-                bonus_token_ids = sampler_output.sampled_token_ids
+                if spec_decode_metadata.target_logits_indices.numel() > 0:
+                    bonus_token_ids = sampler_output.sampled_token_ids
 
-                # Just like `bonus_logits`, `target_logits` is a new tensor with
-                # separate storage from the original `logits` tensor. Therefore,
-                # it is safe to update `target_logits` in place.
-                target_logits = logits[
-                    spec_decode_metadata.target_logits_indices]
-                output_token_ids = self.rejection_sampler(
-                    spec_decode_metadata,
-                    None,  # draft_probs
-                    target_logits,
-                    bonus_token_ids,
-                    sampling_metadata,
-                )
-                sampler_output.sampled_token_ids = output_token_ids
-                if self.need_accepted_tokens:
-                    self._update_states_after_model_execute(output_token_ids)
+                    # Just like `bonus_logits`, `target_logits` is a new tensor
+                    # with separate storage from the original `logits` tensor.
+                    # Therefore, it is safe to update `target_logits` in place.
+                    target_logits = logits[
+                        spec_decode_metadata.target_logits_indices]
+                    output_token_ids = self.rejection_sampler(
+                        spec_decode_metadata,
+                        None,  # draft_probs
+                        target_logits,
+                        bonus_token_ids,
+                        sampling_metadata,
+                    )
+                    sampler_output.sampled_token_ids = output_token_ids
+                    if self.need_accepted_tokens:
+                        self._update_states_after_model_execute(output_token_ids)
+                else:
+                    # No draft tokens were proposed for this step; skip
+                    # rejection-sampler path and keep bonus-token sampling.
+                    if self.need_accepted_tokens:
+                        self._update_states_after_model_execute(
+                            sampler_output.sampled_token_ids)
 
             discard_sampled_tokens_req_indices: list[int] = []
             # TODO(woosuk): The following loop can be slow since it iterates over
