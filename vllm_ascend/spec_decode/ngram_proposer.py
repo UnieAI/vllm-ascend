@@ -101,10 +101,34 @@ class NgramProposer(VllmNgramProposer, Proposer):
                   dummy_compute_logits=lambda hidden_states: None):
         pass
 
+    @staticmethod
+    def _num_sampled_ids(sampled_ids) -> int:
+        if sampled_ids is None:
+            return 0
+        try:
+            return len(sampled_ids)
+        except TypeError:
+            return 1
+
+    @staticmethod
+    def _first_token_id(sampled_ids):
+        if sampled_ids is None:
+            return None
+        try:
+            if len(sampled_ids) == 0:
+                return None
+            first = sampled_ids[0]
+        except TypeError:
+            first = sampled_ids
+        try:
+            return int(first)
+        except (TypeError, ValueError):
+            return None
+
     def should_propose_for_request(self, request_index: int,
                                    sampled_ids: list[int],
                                    num_tokens: int) -> bool:
-        if not sampled_ids:
+        if self._num_sampled_ids(sampled_ids) == 0:
             return False
         if num_tokens >= self.max_model_len:
             return False
@@ -118,7 +142,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
         num_valid_requests = 0
 
         for i, sampled_ids in enumerate(sampled_token_ids):
-            if not sampled_ids:
+            if self._num_sampled_ids(sampled_ids) == 0:
                 continue
             num_tokens = num_tokens_no_spec[i]
             if num_tokens >= self.max_model_len:
@@ -253,9 +277,10 @@ class NgramProposer(VllmNgramProposer, Proposer):
         adjusted_num_tokens = 0
         min_num_tokens = self.max_model_len
         max_num_tokens = 0
+        zero_first_token = 0
 
         for i, sampled_ids in enumerate(valid_sampled_token_ids):
-            num_sampled_ids = len(sampled_ids)
+            num_sampled_ids = self._num_sampled_ids(sampled_ids)
             if not num_sampled_ids:
                 continue
             non_empty_sampled += 1
@@ -276,6 +301,9 @@ class NgramProposer(VllmNgramProposer, Proposer):
             if not self.should_propose_for_request(i, sampled_ids, num_tokens):
                 if num_tokens >= self.max_model_len:
                     skipped_max_len += 1
+                first_token = self._first_token_id(sampled_ids)
+                if first_token == 0:
+                    zero_first_token += 1
                 continue
 
             valid_ngram_requests[num_valid_requests] = i
@@ -285,13 +313,14 @@ class NgramProposer(VllmNgramProposer, Proposer):
             logger.warning(
                 "ASCEND_NGRAM_VALIDATION_EMPTY sampled=%d skipped_max_len=%d "
                 "adjusted_num_tokens=%d min_num_tokens=%d max_num_tokens=%d "
-                "max_model_len=%d",
+                "max_model_len=%d zero_first_token=%d",
                 non_empty_sampled,
                 skipped_max_len,
                 adjusted_num_tokens,
                 min_num_tokens,
                 max_num_tokens,
                 self.max_model_len,
+                zero_first_token,
             )
 
         return self.batch_propose(
