@@ -1839,11 +1839,21 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self, output_token_ids: torch.Tensor, vocab_size: int,
             logprobs_tensors: Optional[LogprobsTensors]
     ) -> tuple[list[list[int]], Optional[list]]:
-        parsed_output = self.rejection_sampler.parse_output(
-            output_token_ids,
-            vocab_size,
-            logprobs_tensors=logprobs_tensors,
-        )
+        try:
+            parsed_output = self.rejection_sampler.parse_output(
+                output_token_ids,
+                vocab_size,
+                logprobs_tensors=logprobs_tensors,
+            )
+        except TypeError as e:
+            if "unexpected keyword argument 'logprobs_tensors'" not in str(e):
+                raise
+            # Backward compatibility for older vLLM where parse_output does not
+            # accept logprobs_tensors.
+            parsed_output = self.rejection_sampler.parse_output(
+                output_token_ids,
+                vocab_size,
+            )
         if isinstance(parsed_output, tuple):
             valid_sampled_token_ids, logprobs_lists = parsed_output
             return valid_sampled_token_ids, logprobs_lists
