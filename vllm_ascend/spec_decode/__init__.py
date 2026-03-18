@@ -16,17 +16,12 @@
 # This file is a part of the vllm-ascend project.
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
-from vllm.logger import init_logger
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
 from vllm_ascend.spec_decode.mtp_proposer import MtpProposer
 from vllm_ascend.spec_decode.ngram_proposer import NgramProposer
 
-logger = init_logger(__name__)
-
 
 def get_spec_decode_method(method, vllm_config, device, runner):
-    logger.warning("ASCEND_SPEC_DECODE_METHOD_MARKER method=%s file=%s", method,
-                   __file__)
     if method == "ngram":
         return NgramProposer(vllm_config, device, runner)
     elif method in ["eagle", "eagle3"]:

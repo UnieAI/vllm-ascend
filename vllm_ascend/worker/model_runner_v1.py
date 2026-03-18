@@ -343,14 +343,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 self.drafter = get_spec_decode_method(
                     self.speculative_config.method, self.vllm_config,
                     self.device, self)
-                if self.speculative_config.method == "ngram":
-                    logger.warning(
-                        "ASCEND_NGRAM_RUNTIME_MARKER async_scheduling=%s "
-                        "max_num_reqs=%d max_num_tokens=%d",
-                        self.scheduler_config.async_scheduling,
-                        self.max_num_reqs,
-                        self.max_num_tokens,
-                    )
                 self.rejection_sampler = AscendRejectionSampler()
             self.actual_seq_lengths_q = list(
                 range(self.decode_token_per_req, self.max_num_tokens + 1,
@@ -472,16 +464,16 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self._draft_token_ids: Optional[Union[list[list[int]],
                                               torch.Tensor]] = None
         self.ngram_accept_log_interval = int(
-            os.environ.get("VLLM_ASCEND_NGRAM_ACCEPT_LOG_INTERVAL", "50"))
+            os.environ.get("VLLM_ASCEND_NGRAM_ACCEPT_LOG_INTERVAL", "0"))
         self._ngram_accept_log_steps = 0
         self._ngram_total_draft_tokens = 0
         self._ngram_total_accepted_tokens = 0
         self._ngram_propose_trace_budget = int(
-            os.environ.get("VLLM_ASCEND_NGRAM_PROPOSE_TRACE_BUDGET", "5"))
+            os.environ.get("VLLM_ASCEND_NGRAM_PROPOSE_TRACE_BUDGET", "0"))
         self._ngram_execute_trace_budget = int(
-            os.environ.get("VLLM_ASCEND_NGRAM_EXECUTE_TRACE_BUDGET", "5"))
+            os.environ.get("VLLM_ASCEND_NGRAM_EXECUTE_TRACE_BUDGET", "0"))
         self._ngram_take_draft_trace_budget = int(
-            os.environ.get("VLLM_ASCEND_NGRAM_TAKE_DRAFT_TRACE_BUDGET", "5"))
+            os.environ.get("VLLM_ASCEND_NGRAM_TAKE_DRAFT_TRACE_BUDGET", "0"))
 
         # NOTE: we need to use `in_profile_run` to determine whether `enable_force_load_balance` is True
         self.in_profile_run = False
@@ -520,6 +512,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         self.async_output_copy_stream = torch.npu.Stream() if \
             self.use_async_scheduling else None
+        self.sampled_token_ids_pinned_cpu = torch.empty(
+            (self.max_num_reqs, self.decode_token_per_req),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=self.pin_memory,
+        )
+        self.sampled_token_ids_transfer_event = torch.npu.Event()
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
         # `initialize_kv_cache` based on the kv cache config. However, as in
@@ -1818,17 +1817,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # Speculative decoding is not enabled.
             draft_token_ids = None
         else:
-            if self.drafter.name == SpecDcodeType.NGRAM and \
-                    self._ngram_propose_trace_budget > 0:
-                non_empty_sampled = sum(1 for ids in valid_sampled_token_ids
-                                        if ids)
-                logger.warning(
-                    "ASCEND_NGRAM_PROPOSE_CALL_MARKER non_empty_sampled=%d "
-                    "num_reqs=%d",
-                    non_empty_sampled,
-                    len(valid_sampled_token_ids),
-                )
-                self._ngram_propose_trace_budget -= 1
             draft_token_ids = self.drafter.generate_token_ids(
                 valid_sampled_token_ids, sampling_metadata, scheduler_output,
                 spec_decode_metadata, positions, num_scheduled_tokens,
@@ -1864,6 +1852,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
     def _maybe_log_ngram_accept_rate(
             self, valid_sampled_token_ids: list[list[int]],
             spec_decode_metadata: Optional[SpecDecodeMetadata]) -> None:
+        if self.ngram_accept_log_interval <= 0:
+            return
         if spec_decode_metadata is None or self.drafter is None \
                 or self.drafter.name != SpecDcodeType.NGRAM:
             return
@@ -1887,11 +1877,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self._ngram_total_accepted_tokens += step_accepted_tokens
         self._ngram_accept_log_steps += 1
 
-        should_log = self._ngram_accept_log_steps <= 5
-        if self.ngram_accept_log_interval > 0 and \
-                self._ngram_accept_log_steps % self.ngram_accept_log_interval == 0:
-            should_log = True
-        if should_log:
+        if self._ngram_accept_log_steps % self.ngram_accept_log_interval == 0:
             step_accept_rate = step_accepted_tokens / step_draft_tokens
             total_accept_rate = self._ngram_total_accepted_tokens / \
                 self._ngram_total_draft_tokens
@@ -2021,6 +2007,16 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             logger.debug(f"num_tokens: {num_tokens}, "
                          f"moe_comm_type: {moe_comm_type}")
         return moe_comm_type
+
+    def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
+        # Avoid direct `tolist()` on NPU tensors, which can introduce a broader
+        # stream synchronization in the decode critical path.
+        pinned = self.sampled_token_ids_pinned_cpu[
+            :sampled_token_ids.shape[0], :sampled_token_ids.shape[1]]
+        pinned.copy_(sampled_token_ids, non_blocking=True)
+        self.sampled_token_ids_transfer_event.record()
+        self.sampled_token_ids_transfer_event.synchronize()
+        return pinned.tolist()
 
     @torch.inference_mode()
     def execute_model(
@@ -2222,7 +2218,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 max_gen_len = sampled_token_ids.shape[-1]
                 if max_gen_len == 1:
                     # No spec decode tokens.
-                    valid_sampled_token_ids = sampled_token_ids.tolist()
+                    valid_sampled_token_ids = self._to_list(sampled_token_ids)
                     if logprobs_tensors is not None:
                         # NOTE: NPU -> CPU Sync happens here.
                         logprobs_lists = logprobs_tensors.tolists()
@@ -2243,7 +2239,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 if require_valid_sampled_token_ids_for_proposer:
                     max_gen_len = sampled_token_ids.shape[-1]
                     if max_gen_len == 1:
-                        valid_sampled_token_ids = sampled_token_ids.tolist()
+                        valid_sampled_token_ids = self._to_list(
+                            sampled_token_ids)
                     else:
                         valid_sampled_token_ids, _ = \
                             self._parse_rejection_sampler_output(
@@ -2315,18 +2312,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 req_state.output_token_ids.extend(sampled_ids)
 
             if self.speculative_config:
-                if self.drafter is not None and \
-                        self.drafter.name == SpecDcodeType.NGRAM and \
-                        self._ngram_execute_trace_budget > 0:
-                    non_empty_sampled = sum(1 for ids in valid_sampled_token_ids
-                                            if ids)
-                    logger.warning(
-                        "ASCEND_NGRAM_EXECUTE_STEP_MARKER "
-                        "num_sampled_tokens=%d non_empty_sampled=%d",
-                        num_sampled_tokens,
-                        non_empty_sampled,
-                    )
-                    self._ngram_execute_trace_budget -= 1
                 self._maybe_log_ngram_accept_rate(valid_sampled_token_ids,
                                                   spec_decode_metadata)
                 self._draft_token_ids = self.propose_draft_token_ids(
@@ -2385,18 +2370,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             draft_token_ids = self._draft_token_ids.tolist()
         else:
             draft_token_ids = self._draft_token_ids
-        if self.drafter is not None and self.drafter.name == SpecDcodeType.NGRAM \
-                and self._ngram_take_draft_trace_budget > 0:
-            non_empty_draft = sum(1 for ids in draft_token_ids if ids)
-            total_draft_tokens = sum(len(ids) for ids in draft_token_ids)
-            logger.warning(
-                "ASCEND_NGRAM_TAKE_DRAFT_MARKER non_empty_draft=%d "
-                "total_draft_tokens=%d num_reqs=%d",
-                non_empty_draft,
-                total_draft_tokens,
-                len(draft_token_ids),
-            )
-            self._ngram_take_draft_trace_budget -= 1
         self._draft_token_ids = None
         return DraftTokenIds(req_ids, draft_token_ids)
 

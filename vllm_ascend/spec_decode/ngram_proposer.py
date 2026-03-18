@@ -57,9 +57,6 @@ class NgramProposer(VllmNgramProposer, Proposer):
                 1, self.num_numba_thread_available // max(1, tp_size))
         else:
             self.num_numba_thread_available = 1
-        self.match_log_interval = int(
-            os.environ.get("VLLM_ASCEND_NGRAM_MATCH_LOG_INTERVAL", "50"))
-        self.match_log_steps = 0
 
         warmup_num_reqs = min(8, max_num_seqs)
         warmup_model_len = min(
@@ -73,16 +70,6 @@ class NgramProposer(VllmNgramProposer, Proposer):
             np.full(warmup_num_reqs, warmup_model_len, dtype=np.int32),
             np.zeros((warmup_num_reqs, warmup_model_len), dtype=np.int32),
             valid_ngram_requests=warmup_valid_ngram_requests,
-        )
-        logger.warning(
-            "ASCEND_NGRAM_STARTUP_MARKER file=%s min_n=%d max_n=%d "
-            "num_spec_tokens=%d search_window=%s max_model_len=%d",
-            __file__,
-            self.min_n,
-            self.max_n,
-            self.k,
-            str(self.search_window),
-            self.max_model_len,
         )
 
     def load_model(self, *args, **kwargs):
@@ -109,21 +96,6 @@ class NgramProposer(VllmNgramProposer, Proposer):
             return len(sampled_ids)
         except TypeError:
             return 1
-
-    @staticmethod
-    def _first_token_id(sampled_ids):
-        if sampled_ids is None:
-            return None
-        try:
-            if len(sampled_ids) == 0:
-                return None
-            first = sampled_ids[0]
-        except TypeError:
-            first = sampled_ids
-        try:
-            return int(first)
-        except (TypeError, ValueError):
-            return None
 
     def should_propose_for_request(self, request_index: int,
                                    sampled_ids: list[int],
@@ -193,45 +165,15 @@ class NgramProposer(VllmNgramProposer, Proposer):
                     i, :self.valid_ngram_num_drafts[i]].tolist()
         return draft_token_ids
 
-    def _ensure_match_log_state(self) -> None:
-        # Guard against partial init paths where match-log fields are missing.
-        if not hasattr(self, "match_log_interval"):
-            self.match_log_interval = int(
-                os.environ.get("VLLM_ASCEND_NGRAM_MATCH_LOG_INTERVAL", "50"))
-        if not hasattr(self, "match_log_steps"):
-            self.match_log_steps = 0
-
     def batch_propose(self, num_requests: int,
                       valid_ngram_requests: np.ndarray,
                       num_tokens_no_spec: np.ndarray,
                       token_ids_cpu: np.ndarray) -> list[list[int]]:
-        self._ensure_match_log_state()
         self.run_batch_match(
             valid_ngram_requests,
             num_tokens_no_spec,
             token_ids_cpu,
         )
-        self.match_log_steps += 1
-        should_log = self.match_log_steps <= 5
-        if self.match_log_interval > 0 and \
-                self.match_log_steps % self.match_log_interval == 0:
-            should_log = True
-        if should_log:
-            if len(valid_ngram_requests) > 0:
-                matched_drafts = self.valid_ngram_num_drafts[valid_ngram_requests]
-                matched_reqs = int((matched_drafts > 0).sum())
-                total_draft_tokens = int(matched_drafts.sum(dtype=np.int64))
-            else:
-                matched_reqs = 0
-                total_draft_tokens = 0
-            logger.warning(
-                "ASCEND_NGRAM_MATCH_STATS step=%d valid_reqs=%d "
-                "matched_reqs=%d total_draft_tokens=%d",
-                self.match_log_steps,
-                len(valid_ngram_requests),
-                matched_reqs,
-                total_draft_tokens,
-            )
         return self.materialize_draft_token_ids(
             num_requests,
             valid_ngram_requests,
@@ -272,18 +214,11 @@ class NgramProposer(VllmNgramProposer, Proposer):
         valid_ngram_requests = np.empty(len(valid_sampled_token_ids),
                                         dtype=np.int32)
         num_valid_requests = 0
-        non_empty_sampled = 0
-        skipped_max_len = 0
-        adjusted_num_tokens = 0
-        min_num_tokens = self.max_model_len
-        max_num_tokens = 0
-        zero_first_token = 0
 
         for i, sampled_ids in enumerate(valid_sampled_token_ids):
             num_sampled_ids = self._num_sampled_ids(sampled_ids)
             if not num_sampled_ids:
                 continue
-            non_empty_sampled += 1
 
             num_tokens = int(num_tokens_no_spec[i])
             if num_tokens >= self.max_model_len and i < len(req_ids):
@@ -294,34 +229,12 @@ class NgramProposer(VllmNgramProposer, Proposer):
                     if req_state_tokens < num_tokens:
                         num_tokens = req_state_tokens
                         num_tokens_no_spec[i] = req_state_tokens
-                        adjusted_num_tokens += 1
 
-            min_num_tokens = min(min_num_tokens, num_tokens)
-            max_num_tokens = max(max_num_tokens, num_tokens)
             if not self.should_propose_for_request(i, sampled_ids, num_tokens):
-                if num_tokens >= self.max_model_len:
-                    skipped_max_len += 1
-                first_token = self._first_token_id(sampled_ids)
-                if first_token == 0:
-                    zero_first_token += 1
                 continue
 
             valid_ngram_requests[num_valid_requests] = i
             num_valid_requests += 1
-
-        if non_empty_sampled > 0 and num_valid_requests == 0:
-            logger.warning(
-                "ASCEND_NGRAM_VALIDATION_EMPTY sampled=%d skipped_max_len=%d "
-                "adjusted_num_tokens=%d min_num_tokens=%d max_num_tokens=%d "
-                "max_model_len=%d zero_first_token=%d",
-                non_empty_sampled,
-                skipped_max_len,
-                adjusted_num_tokens,
-                min_num_tokens,
-                max_num_tokens,
-                self.max_model_len,
-                zero_first_token,
-            )
 
         return self.batch_propose(
             len(valid_sampled_token_ids),
