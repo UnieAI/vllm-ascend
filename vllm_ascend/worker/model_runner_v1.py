@@ -19,6 +19,7 @@
 
 import copy
 import gc
+import inspect
 import itertools
 import math
 import os
@@ -400,6 +401,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     self.speculative_config.method, self.vllm_config,
                     self.device, self)
                 self.rejection_sampler = AscendRejectionSampler()
+                self._rejection_parse_supports_logprobs_tensors = \
+                    self._detect_rejection_parse_logprobs_support()
             self.actual_seq_lengths_q = list(
                 range(self.decode_token_per_req, self.max_num_tokens + 1,
                       self.decode_token_per_req))
@@ -557,6 +560,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         self.async_output_copy_stream = torch.npu.Stream() if \
             self.use_async_scheduling else None
+        if not hasattr(self, "_rejection_parse_supports_logprobs_tensors"):
+            self._rejection_parse_supports_logprobs_tensors = False
         self.enable_fast_sampled_token_tolist = bool(
             int(os.environ.get("VLLM_ASCEND_FAST_SAMPLED_TOKEN_TOLIST", "0")))
         if self.enable_fast_sampled_token_tolist:
@@ -1878,17 +1883,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self, output_token_ids: torch.Tensor, vocab_size: int,
             logprobs_tensors: Optional[LogprobsTensors]
     ) -> tuple[list[list[int]], Optional[list]]:
-        try:
+        if self._rejection_parse_supports_logprobs_tensors:
             parsed_output = self.rejection_sampler.parse_output(
                 output_token_ids,
                 vocab_size,
                 logprobs_tensors=logprobs_tensors,
             )
-        except TypeError as e:
-            if "unexpected keyword argument 'logprobs_tensors'" not in str(e):
-                raise
-            # Backward compatibility for older vLLM where parse_output does not
-            # accept logprobs_tensors.
+        else:
             parsed_output = self.rejection_sampler.parse_output(
                 output_token_ids,
                 vocab_size,
@@ -1899,6 +1900,19 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         logprobs_lists = logprobs_tensors.tolists() \
             if logprobs_tensors is not None else None
         return parsed_output, logprobs_lists
+
+    def _detect_rejection_parse_logprobs_support(self) -> bool:
+        parse_output = getattr(self.rejection_sampler, "parse_output", None)
+        if parse_output is None:
+            return False
+        try:
+            params = inspect.signature(parse_output).parameters
+        except (TypeError, ValueError):
+            return False
+        if "logprobs_tensors" in params:
+            return True
+        return any(p.kind == inspect.Parameter.VAR_KEYWORD
+                   for p in params.values())
 
     def _pool(
         self,
