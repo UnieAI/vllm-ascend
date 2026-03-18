@@ -393,44 +393,48 @@ def rejection_random_sample_pytorch(
     IS_NGRAM=False,
 ):
     batch_size = output_token_ids.shape[0]
+    bonus_token_ids = bonus_token_ids.squeeze(1)
+    cu_num_draft_tokens_cpu = cu_num_draft_tokens.to("cpu").tolist()
+    is_greedy_cpu = is_greedy.to("cpu").tolist()
 
     for req_idx in range(batch_size):
-        if is_greedy[req_idx]:
+        if is_greedy_cpu[req_idx]:
             continue
 
-        if req_idx == 0:
-            start_idx = 0
-        else:
-            start_idx = cu_num_draft_tokens[req_idx - 1].item()
-        end_idx = cu_num_draft_tokens[req_idx].item()
+        start_idx = 0 if req_idx == 0 else cu_num_draft_tokens_cpu[req_idx - 1]
+        end_idx = cu_num_draft_tokens_cpu[req_idx]
         num_draft_tokens = end_idx - start_idx
 
-        rejected = False
-        for pos in range(num_draft_tokens):
-            if not rejected:
-                draft_token_id = draft_token_ids[start_idx + pos].item()
+        if num_draft_tokens == 0:
+            output_token_ids[req_idx, 0] = bonus_token_ids[req_idx]
+            continue
 
-                if IS_NGRAM:
-                    draft_prob = 1.0
-                else:
-                    draft_prob = draft_probs[start_idx + pos,
-                                             draft_token_id].item()
+        row_slice = slice(start_idx, end_idx)
+        req_draft_token_ids = draft_token_ids[row_slice].to(torch.long)
+        req_target_probs = target_probs[row_slice].gather(
+            1, req_draft_token_ids.unsqueeze(1)).squeeze(1)
+        if IS_NGRAM:
+            req_draft_probs = torch.ones_like(req_target_probs)
+        else:
+            assert draft_probs is not None
+            req_draft_probs = draft_probs[row_slice].gather(
+                1, req_draft_token_ids.unsqueeze(1)).squeeze(1)
+        req_uniform_probs = uniform_probs[row_slice]
+        accept_mask = (req_draft_probs > 0) & \
+            (req_target_probs / req_draft_probs >= req_uniform_probs)
+        reject_mask = ~accept_mask
 
-                target_prob = target_probs[start_idx + pos,
-                                           draft_token_id].item()
-                uniform_prob = uniform_probs[start_idx + pos].item()
-
-                if draft_prob > 0 and target_prob / draft_prob >= uniform_prob:
-                    token_id = draft_token_id
-                else:
-                    rejected = True
-                    token_id = recovered_token_ids[start_idx + pos].item()
-
-                output_token_ids[req_idx, pos] = token_id
-
-        if not rejected:
-            bonus_token_id = bonus_token_ids[req_idx].item()
-            output_token_ids[req_idx, num_draft_tokens] = bonus_token_id
+        if reject_mask.any():
+            first_reject = int(torch.argmax(reject_mask.to(torch.int32)).item())
+            if first_reject > 0:
+                output_token_ids[req_idx,
+                                 :first_reject] = req_draft_token_ids[:first_reject]
+            output_token_ids[req_idx,
+                             first_reject] = recovered_token_ids[start_idx
+                                                                 + first_reject]
+        else:
+            output_token_ids[req_idx, :num_draft_tokens] = req_draft_token_ids
+            output_token_ids[req_idx, num_draft_tokens] = bonus_token_ids[req_idx]
 
 
 def expand_pytorch(
@@ -469,36 +473,28 @@ def sample_recovered_tokens_pytorch(
     IS_NGRAM=False,
 ):
     batch_size = len(cu_num_draft_tokens)
+    cu_num_draft_tokens_cpu = cu_num_draft_tokens.to("cpu").tolist()
 
     for req_idx in range(batch_size):
-        start_idx = 0 if req_idx == 0 else cu_num_draft_tokens[req_idx - 1]
-        end_idx = cu_num_draft_tokens[req_idx]
-        num_draft_tokens = end_idx - start_idx
+        start_idx = 0 if req_idx == 0 else cu_num_draft_tokens_cpu[req_idx - 1]
+        end_idx = cu_num_draft_tokens_cpu[req_idx]
+        if end_idx <= start_idx:
+            continue
 
-        for pos in range(num_draft_tokens):
-            token_idx = start_idx + pos
+        row_slice = slice(start_idx, end_idx)
+        req_q = q[req_idx, :vocab_size]
 
-            if IS_NGRAM:
-                draft_token_id = draft_token_ids[token_idx]
-                orig_prob = target_probs[token_idx, draft_token_id].item()
-                target_probs[token_idx, draft_token_id] = 0
-                prob = target_probs[token_idx].clone()
-            else:
-                draft_p = draft_probs[token_idx].clone()
-                target_p = target_probs[token_idx].clone()
-                prob = torch.maximum(target_p - draft_p,
-                                     torch.tensor(0.0, device=target_p.device))
+        if IS_NGRAM:
+            req_draft_token_ids = draft_token_ids[row_slice].to(torch.long)
+            scores = target_probs[row_slice] / req_q.unsqueeze(0)
+            row_ids = torch.arange(scores.shape[0], device=scores.device)
+            scores[row_ids, req_draft_token_ids] = float("-inf")
+        else:
+            assert draft_probs is not None
+            scores = (target_probs[row_slice] - draft_probs[row_slice]).clamp_min(0)
+            scores = scores / req_q.unsqueeze(0)
 
-            q_values = torch.full((vocab_size, ),
-                                  float('-inf'),
-                                  device=q.device)
-            q_values[:vocab_size] = q[req_idx, :vocab_size]
-
-            recovered_id = torch.argmax(prob / q_values).item()
-            output_token_ids[token_idx] = recovered_id
-
-            if IS_NGRAM:
-                target_probs[token_idx, draft_token_id] = orig_prob
+        output_token_ids[row_slice] = torch.argmax(scores, dim=1)
 
 
 rs.expand_batch_to_tokens = expand_batch_to_tokens
