@@ -191,6 +191,43 @@ def graph_capture(device: torch.device):
         yield graph_capture_context
 
 
+def _normalize_sampled_token_ids(
+        sampled_token_ids: list[Any]) -> list[list[int]]:
+    normalized: list[list[int]] = []
+    for row in sampled_token_ids:
+        if row is None:
+            normalized.append([])
+            continue
+
+        if isinstance(row, torch.Tensor):
+            row = row.tolist()
+        elif isinstance(row, np.ndarray):
+            row = row.tolist()
+
+        if isinstance(row, (int, np.integer)):
+            normalized.append([int(row)])
+            continue
+
+        if not isinstance(row, list):
+            normalized.append([int(row)])
+            continue
+
+        flat_row: list[int] = []
+        for token in row:
+            if isinstance(token, torch.Tensor):
+                token = token.tolist()
+            elif isinstance(token, np.ndarray):
+                token = token.tolist()
+
+            if isinstance(token, list):
+                for nested_token in token:
+                    flat_row.append(int(nested_token))
+            else:
+                flat_row.append(int(token))
+        normalized.append(flat_row)
+    return normalized
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncNPUModelRunnerOutput(AsyncModelRunnerOutput):
 
@@ -229,7 +266,8 @@ class AsyncNPUModelRunnerOutput(AsyncModelRunnerOutput):
         # Release the device tensor once the copy has completed
         del self._sampled_token_ids
 
-        valid_sampled_token_ids = self._sampled_token_ids_cpu.tolist()
+        valid_sampled_token_ids = _normalize_sampled_token_ids(
+            self._sampled_token_ids_cpu.tolist())
         for i in self._invalid_req_indices:
             valid_sampled_token_ids[i].clear()
 
@@ -512,13 +550,19 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.use_async_scheduling = self.scheduler_config.async_scheduling
         self.async_output_copy_stream = torch.npu.Stream() if \
             self.use_async_scheduling else None
-        self.sampled_token_ids_pinned_cpu = torch.empty(
-            (self.max_num_reqs, self.decode_token_per_req),
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=self.pin_memory,
-        )
-        self.sampled_token_ids_transfer_event = torch.npu.Event()
+        self.enable_fast_sampled_token_tolist = bool(
+            int(os.environ.get("VLLM_ASCEND_FAST_SAMPLED_TOKEN_TOLIST", "0")))
+        if self.enable_fast_sampled_token_tolist:
+            self.sampled_token_ids_pinned_cpu = torch.empty(
+                (self.max_num_reqs, self.decode_token_per_req),
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
+            self.sampled_token_ids_transfer_event = torch.npu.Event()
+        else:
+            self.sampled_token_ids_pinned_cpu = None
+            self.sampled_token_ids_transfer_event = None
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
         # `initialize_kv_cache` based on the kv cache config. However, as in
@@ -2009,8 +2053,17 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         return moe_comm_type
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
-        # Avoid direct `tolist()` on NPU tensors, which can introduce a broader
-        # stream synchronization in the decode critical path.
+        if not self.enable_fast_sampled_token_tolist:
+            return sampled_token_ids.tolist()
+
+        if sampled_token_ids.dim() != 2:
+            return sampled_token_ids.tolist()
+        assert self.sampled_token_ids_pinned_cpu is not None
+        assert self.sampled_token_ids_transfer_event is not None
+        if sampled_token_ids.shape[1] > self.sampled_token_ids_pinned_cpu.shape[1]:
+            return sampled_token_ids.tolist()
+
+        # Fast path (opt-in): use pinned host buffer and explicit event sync.
         pinned = self.sampled_token_ids_pinned_cpu[
             :sampled_token_ids.shape[0], :sampled_token_ids.shape[1]]
         pinned.copy_(sampled_token_ids, non_blocking=True)
@@ -2233,6 +2286,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 # Mask out the sampled tokens that should not be sampled.
                 for i in discard_sampled_tokens_req_indices:
                     valid_sampled_token_ids[i].clear()
+                valid_sampled_token_ids = _normalize_sampled_token_ids(
+                    valid_sampled_token_ids)
             else:
                 invalid_req_indices = list(discard_sampled_tokens_req_indices)
                 invalid_req_indices_set = set(invalid_req_indices)
@@ -2250,6 +2305,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                             )
                     for i in discard_sampled_tokens_req_indices:
                         valid_sampled_token_ids[i].clear()
+                    valid_sampled_token_ids = _normalize_sampled_token_ids(
+                        valid_sampled_token_ids)
                 else:
                     valid_sampled_token_ids = []
                     assert sampled_token_ids.shape[-1] == 1
