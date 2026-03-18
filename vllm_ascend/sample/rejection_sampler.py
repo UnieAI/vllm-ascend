@@ -238,15 +238,22 @@ def expand_batch_to_tokens(
     """
     batch_size = x.shape[0]
     assert cu_num_tokens.shape[0] == batch_size
-    expanded_x = x.new_empty(num_tokens)
-    expand_pytorch(
-        expanded_x,
-        x,
-        cu_num_tokens,
-        replace_from,
-        replace_to,
-        MAX_NUM_TOKENS=MAX_SPEC_LEN,  # To avoid recompilation.
-    )
+    if num_tokens == 0:
+        return x.new_empty((0, ))
+
+    cu_num_tokens = cu_num_tokens.to(device=x.device, dtype=torch.long)
+    num_tokens_per_req = torch.empty_like(cu_num_tokens)
+    num_tokens_per_req[0] = cu_num_tokens[0]
+    if batch_size > 1:
+        num_tokens_per_req[1:] = cu_num_tokens[1:] - cu_num_tokens[:-1]
+
+    expanded_x = x.repeat_interleave(num_tokens_per_req)
+    if replace_from != replace_to:
+        replace_to_tensor = torch.as_tensor(replace_to,
+                                            dtype=expanded_x.dtype,
+                                            device=expanded_x.device)
+        expanded_x = torch.where(expanded_x == replace_from, replace_to_tensor,
+                                 expanded_x)
     return expanded_x
 
 
