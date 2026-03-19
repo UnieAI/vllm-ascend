@@ -368,6 +368,24 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.spec_attn_mask = None
         self.drafter: Optional[Union[NgramProposer, EagleProposer,
                                      MtpProposer]] = None
+        self.ngram_batch_gate_min_reqs = max(
+            1,
+            int(os.environ.get("VLLM_ASCEND_NGRAM_BATCH_GATE_MIN_REQS", "2")),
+        )
+        self.ngram_batch_gate_min_coverage = min(
+            1.0,
+            max(
+                0.0,
+                float(os.environ.get(
+                    "VLLM_ASCEND_NGRAM_BATCH_GATE_MIN_COVERAGE", "0.0")),
+            ),
+        )
+        self.ngram_batch_gate_min_avg_drafts = max(
+            0.0,
+            float(
+                os.environ.get("VLLM_ASCEND_NGRAM_BATCH_GATE_MIN_AVG_DRAFTS",
+                               "0.0")),
+        )
         self.actual_seq_lengths_q: list[int] = []
         self.decode_token_per_req = 1
         if self.speculative_config:
@@ -1859,6 +1877,25 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 valid_sampled_token_ids, sampling_metadata, scheduler_output,
                 spec_decode_metadata, positions, num_scheduled_tokens,
                 hidden_states, attn_metadata, aux_hidden_states)
+            if (self.drafter.name == SpecDcodeType.NGRAM
+                    and isinstance(draft_token_ids, list)):
+                num_reqs = len(draft_token_ids)
+                if (num_reqs >= self.ngram_batch_gate_min_reqs and
+                    (self.ngram_batch_gate_min_coverage > 0.0
+                     or self.ngram_batch_gate_min_avg_drafts > 0.0)):
+                    non_empty_drafts = 0
+                    total_drafts = 0
+                    for row in draft_token_ids:
+                        row_len = len(row)
+                        if row_len > 0:
+                            non_empty_drafts += 1
+                            total_drafts += row_len
+                    draft_coverage = non_empty_drafts / num_reqs
+                    avg_drafts = total_drafts / num_reqs
+                    if (draft_coverage < self.ngram_batch_gate_min_coverage
+                            or avg_drafts <
+                            self.ngram_batch_gate_min_avg_drafts):
+                        draft_token_ids = [[] for _ in range(num_reqs)]
         return draft_token_ids
 
     def _parse_rejection_sampler_output(

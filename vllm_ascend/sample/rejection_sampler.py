@@ -16,6 +16,49 @@ GREEDY_TEMPERATURE = -1
 # step. This value is chosen to be large enough to handle typical use cases.
 MAX_SPEC_LEN = 32
 
+_SCATTER_REDUCE_AMIN_SUPPORTED: Optional[bool] = None
+
+
+def _compute_first_reject_pos(
+    batch_size: int,
+    max_spec_len: int,
+    reject_req_ids: torch.Tensor,
+    reject_token_positions: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    first_reject_pos = torch.full((batch_size,),
+                                  max_spec_len,
+                                  dtype=torch.long,
+                                  device=device)
+    if reject_req_ids.numel() == 0:
+        return first_reject_pos
+
+    global _SCATTER_REDUCE_AMIN_SUPPORTED
+    if _SCATTER_REDUCE_AMIN_SUPPORTED is not False:
+        try:
+            first_reject_pos.scatter_reduce_(
+                0,
+                reject_req_ids,
+                reject_token_positions,
+                reduce="amin",
+                include_self=True,
+            )
+            _SCATTER_REDUCE_AMIN_SUPPORTED = True
+            return first_reject_pos
+        except (AttributeError, RuntimeError):
+            _SCATTER_REDUCE_AMIN_SUPPORTED = False
+
+    if max_spec_len <= 0:
+        return first_reject_pos
+    reject_matrix = torch.zeros((batch_size, max_spec_len),
+                                dtype=torch.bool,
+                                device=device)
+    reject_matrix[reject_req_ids, reject_token_positions] = True
+    pos_matrix = torch.arange(max_spec_len, device=device).expand(batch_size, -1)
+    first_reject_pos, _ = torch.min(
+        torch.where(reject_matrix, pos_matrix, max_spec_len), dim=1)
+    return first_reject_pos
+
 
 class AscendRejectionSampler(RejectionSampler, nn.Module):
     """
@@ -217,38 +260,27 @@ def rejection_sample_ngram_from_logits(
     accept_mask = (draft_logits - log_denom) >= log_uniform
     reject_mask = ~accept_mask
 
-    draft_matrix = torch.full(
-        (batch_size, max_spec_len),
-        PLACEHOLDER_TOKEN_ID,
-        dtype=output_token_ids.dtype,
+    token_reject_mask = token_is_random & reject_mask
+    reject_req_ids = token_req_ids[token_reject_mask]
+    reject_positions = token_positions[token_reject_mask]
+    first_reject_pos = _compute_first_reject_pos(
+        batch_size=batch_size,
+        max_spec_len=max_spec_len,
+        reject_req_ids=reject_req_ids,
+        reject_token_positions=reject_positions,
         device=device,
     )
-    draft_matrix[token_req_ids[token_is_random],
-                 token_positions[token_is_random]] = draft_token_ids[
-                     token_is_random]
-    reject_matrix = torch.zeros((batch_size, max_spec_len),
-                                dtype=torch.bool,
-                                device=device)
-    reject_matrix[token_req_ids[token_is_random],
-                  token_positions[token_is_random]] = reject_mask[token_is_random]
-
-    pos_matrix = torch.arange(max_spec_len,
-                              device=device).expand(batch_size, -1)
-    first_reject_pos, _ = torch.min(
-        torch.where(reject_matrix, pos_matrix, max_spec_len + 1), dim=1)
     random_with_draft_mask = random_req_mask & (num_draft_tokens_tensor > 0)
     has_reject_mask = random_with_draft_mask & (first_reject_pos
                                                 < num_draft_tokens_tensor)
     no_reject_mask = random_with_draft_mask & ~has_reject_mask
 
-    copy_len = torch.zeros(batch_size, dtype=torch.long, device=device)
-    copy_len[has_reject_mask] = first_reject_pos[has_reject_mask]
-    copy_len[no_reject_mask] = num_draft_tokens_tensor[no_reject_mask]
-    if max_spec_len > 0:
-        copy_mask = ((torch.arange(max_spec_len, device=device).expand(
-            batch_size, -1) < copy_len.unsqueeze(1))
-                     & random_with_draft_mask.unsqueeze(1))
-        output_token_ids[:, :max_spec_len][copy_mask] = draft_matrix[copy_mask]
+    accepted_token_mask = token_is_random & (
+        token_positions < first_reject_pos[token_req_ids])
+    if accepted_token_mask.any():
+        output_token_ids[token_req_ids[accepted_token_mask],
+                         token_positions[accepted_token_mask]] = draft_token_ids[
+                             accepted_token_mask]
 
     if has_reject_mask.any():
         reject_rows = torch.where(has_reject_mask)[0]
@@ -627,40 +659,27 @@ def rejection_random_sample_pytorch(
                    & (req_target_probs / req_draft_probs >= uniform_probs))
     reject_mask = ~accept_mask
 
-    # Build compact [batch_size, max_spec_len] matrices to avoid per-request
-    # Python loops and per-step CPU synchronization in random rejection path.
-    draft_matrix = torch.full(
-        (batch_size, max_spec_len),
-        PLACEHOLDER_TOKEN_ID,
-        dtype=output_token_ids.dtype,
+    token_reject_mask = token_is_random & reject_mask
+    reject_req_ids = token_req_ids[token_reject_mask]
+    reject_positions = token_positions[token_reject_mask]
+    first_reject_pos = _compute_first_reject_pos(
+        batch_size=batch_size,
+        max_spec_len=max_spec_len,
+        reject_req_ids=reject_req_ids,
+        reject_token_positions=reject_positions,
         device=device,
     )
-    draft_matrix[token_req_ids[token_is_random],
-                 token_positions[token_is_random]] = draft_token_ids[
-                     token_is_random]
-    reject_matrix = torch.zeros((batch_size, max_spec_len),
-                                dtype=torch.bool,
-                                device=device)
-    reject_matrix[token_req_ids[token_is_random],
-                  token_positions[token_is_random]] = reject_mask[token_is_random]
-
-    pos_matrix = torch.arange(max_spec_len,
-                              device=device).expand(batch_size, -1)
-    first_reject_pos, _ = torch.min(
-        torch.where(reject_matrix, pos_matrix, max_spec_len + 1), dim=1)
     random_with_draft_mask = random_req_mask & (num_draft_tokens > 0)
     has_reject_mask = random_with_draft_mask & (first_reject_pos
                                                 < num_draft_tokens)
     no_reject_mask = random_with_draft_mask & ~has_reject_mask
 
-    copy_len = torch.zeros(batch_size, dtype=torch.long, device=device)
-    copy_len[has_reject_mask] = first_reject_pos[has_reject_mask]
-    copy_len[no_reject_mask] = num_draft_tokens[no_reject_mask]
-    if max_spec_len > 0:
-        copy_mask = ((torch.arange(max_spec_len, device=device).expand(
-            batch_size, -1) < copy_len.unsqueeze(1))
-                     & random_with_draft_mask.unsqueeze(1))
-        output_token_ids[:, :max_spec_len][copy_mask] = draft_matrix[copy_mask]
+    accepted_token_mask = token_is_random & (
+        token_positions < first_reject_pos[token_req_ids])
+    if accepted_token_mask.any():
+        output_token_ids[token_req_ids[accepted_token_mask],
+                         token_positions[accepted_token_mask]] = draft_token_ids[
+                             accepted_token_mask]
 
     if has_reject_mask.any():
         reject_rows = torch.where(has_reject_mask)[0]

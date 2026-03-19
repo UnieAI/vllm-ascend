@@ -232,3 +232,40 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
    - lazy-recover helper 在 `sampling_metadata.generators` 為空時，不再做 reject-row CPU 索引/迴圈。
    - 精簡 helper 參數與呼叫資料流，移除不再使用的 `num_draft_tokens` 傳遞。
 影響：目標是降低 proposer/rejection 兩個 CPU 熱點的固定成本，提高 steady-state util 與 16-concurrency 吞吐。
+
+## `(this commit)` - 回退高併發硬降級，改為 batch 品質閥值 + token-level rejection 快路徑
+背景：目前觀察到 ngram 在 `1 concurrency` 已經沒有優勢，`16 concurrency`（低併發）反而顯著變慢。原先「按併發門檻直接降級/關閉 ngram」不符合預期，因此改為回退並重寫熱路徑。
+
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - 回退並移除預設高併發硬降級路徑（不再以 request 數量直接關閉 proposer）。
+   - 移除下列預設限流邏輯在熱路徑的干預：
+     - `VLLM_ASCEND_NGRAM_HIGH_CONC_REQ_THRESHOLD`
+     - `VLLM_ASCEND_NGRAM_HIGH_CONC_MAX_DRAFT_TOKENS`
+     - `VLLM_ASCEND_NGRAM_MAX_MATCH_REQS_PER_STEP`
+     - `VLLM_ASCEND_NGRAM_HIGH_CONC_DISABLE_THRESHOLD`
+   - Numba thread 決策改為 upstream 風格的 token 規模判斷：
+     - 新增 `VLLM_ASCEND_NGRAM_NUMBA_TOKENS_THRESHOLD`（預設 `8192`）。
+     - 只有當本步 `valid_ngram_requests` 的 `total_tokens` 超過門檻才啟用多執行緒，避免小 batch 的 thread 切換固定成本。
+
+2. `vllm_ascend/worker/model_runner_v1.py`
+   - 新增「batch draft 品質閥值」機制，避免只有極少 request 有 draft 時，整個 batch 被拉進 speculative 重路徑：
+     - `VLLM_ASCEND_NGRAM_BATCH_GATE_MIN_REQS`（預設 `2`）
+     - `VLLM_ASCEND_NGRAM_BATCH_GATE_MIN_COVERAGE`（預設 `0.0`，關閉）
+     - `VLLM_ASCEND_NGRAM_BATCH_GATE_MIN_AVG_DRAFTS`（預設 `0.0`，關閉）
+   - 行為：
+     - 只在 NGRAM proposer 且 `num_reqs >= MIN_REQS` 時啟用檢查。
+     - 若覆蓋率或平均 draft 數低於門檻，該步回傳全空 drafts，讓下一步回到 decode-only；避免「少數 draft 拖慢全批」。
+   - 預設為關閉（coverage/avg 皆為 0），確保不再出現強制降級的預設副作用；需要時可透過 env 逐步打開。
+
+3. `vllm_ascend/sample/rejection_sampler.py`
+   - 將 ngram/logits rejection 與 random rejection 的「首個 reject 位置」計算改成 token-level 路徑：
+     - 優先使用 `scatter_reduce_(amin)` 直接在 `[batch]` 向量上求每個 request 的 first reject pos。
+     - 若後端不支援，單次探測後自動退回矩陣 fallback（避免每步反覆丟例外）。
+   - 移除每步建立 `draft_matrix/reject_matrix/copy_mask` 的主要熱路徑分配。
+   - 改為直接用 token 級 mask 寫回 accepted draft tokens，減少小步高頻 kernel 與中間張量建構成本。
+
+影響：
+- 回退不合理的「按併發硬關閉」策略，恢復 ngram 在低併發場景的可用性。
+- 降低 rejection sampler 每步固定成本，目標是改善 decode 階段 NPU util 與 16-concurrency 吞吐。
+- 提供可控的 batch gate（預設關閉），後續可在目標機用環境變數做 A/B 微調。

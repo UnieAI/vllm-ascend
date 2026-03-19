@@ -42,37 +42,9 @@ class NgramProposer(VllmNgramProposer, Proposer):
         self.default_search_window = max(
             0,
             int(os.environ.get("VLLM_ASCEND_NGRAM_DEFAULT_SEARCH_WINDOW",
-                               "1024")),
-        )
-        self.k = vllm_config.speculative_config.num_speculative_tokens
-        self.high_conc_req_threshold = max(
-            0,
-            int(
-                os.environ.get("VLLM_ASCEND_NGRAM_HIGH_CONC_REQ_THRESHOLD",
-                               "8")),
-        )
-        self.high_conc_max_draft_tokens = max(
-            1,
-            min(
-                self.k,
-                int(
-                    os.environ.get("VLLM_ASCEND_NGRAM_HIGH_CONC_MAX_DRAFT_TOKENS",
-                                   str(min(2, self.k)))),
-            ),
-        )
-        self.max_match_reqs_per_step = max(
-            0,
-            int(
-                os.environ.get("VLLM_ASCEND_NGRAM_MAX_MATCH_REQS_PER_STEP",
                                "0")),
         )
-        self._match_req_rr_cursor = 0
-        self.high_conc_disable_threshold = max(
-            0,
-            int(
-                os.environ.get(
-                    "VLLM_ASCEND_NGRAM_HIGH_CONC_DISABLE_THRESHOLD", "12")),
-        )
+        self.k = vllm_config.speculative_config.num_speculative_tokens
         self.max_model_len = vllm_config.model_config.max_model_len
 
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
@@ -95,11 +67,11 @@ class NgramProposer(VllmNgramProposer, Proposer):
                 os.environ.get("VLLM_ASCEND_NGRAM_NUMBA_THREADS",
                                str(default_numba_threads))),
         )
-        self.num_numba_min_parallel_reqs = max(
+        self.num_tokens_threshold = max(
             1,
             int(
-                os.environ.get("VLLM_ASCEND_NGRAM_NUMBA_MIN_PARALLEL_REQS",
-                               "8")),
+                os.environ.get("VLLM_ASCEND_NGRAM_NUMBA_TOKENS_THRESHOLD",
+                               "8192")),
         )
         # Keep one thread for small batches and only switch when needed.
         self._current_numba_threads = 1
@@ -222,7 +194,8 @@ class NgramProposer(VllmNgramProposer, Proposer):
             self._current_numba_threads = 1
             set_num_threads(self._current_numba_threads)
         desired_threads = 1
-        if num_ngram_requests >= self.num_numba_min_parallel_reqs:
+        total_tokens = int(np.sum(num_tokens_no_spec[valid_ngram_requests]))
+        if total_tokens >= self.num_tokens_threshold:
             desired_threads = min(self.num_numba_thread_available,
                                   num_ngram_requests)
         if desired_threads != self._current_numba_threads:
@@ -279,19 +252,6 @@ class NgramProposer(VllmNgramProposer, Proposer):
                       valid_ngram_requests: np.ndarray,
                       num_tokens_no_spec: np.ndarray,
                       token_ids_cpu: np.ndarray) -> list[list[int]]:
-        if (self.high_conc_disable_threshold > 0
-                and num_requests >= self.high_conc_disable_threshold):
-            # Under high concurrency, ngram draft generation often becomes
-            # net-negative (CPU-bound matcher + verification overhead).
-            # Return empty drafts to fall back to normal decode cost.
-            if num_requests > 0:
-                self._ensure_request_backoff_state(num_requests)
-                self._req_skip_match_steps[:num_requests] = 0
-                self._req_no_match_streak[:num_requests] = 0
-                if valid_ngram_requests.size > 0:
-                    self.valid_ngram_num_drafts[valid_ngram_requests] = 0
-            return [[] for _ in range(num_requests)]
-
         self._ensure_request_backoff_state(num_requests)
         num_ngram_requests = len(valid_ngram_requests)
         if num_ngram_requests == 0:
@@ -329,21 +289,6 @@ class NgramProposer(VllmNgramProposer, Proposer):
 
         run_requests = valid_ngram_requests[run_mask]
         if run_requests.size > 0:
-            if self.max_match_reqs_per_step > 0 and \
-                    run_requests.size > self.max_match_reqs_per_step:
-                rr_start = self._match_req_rr_cursor % run_requests.size
-                rr_indices = (np.arange(self.max_match_reqs_per_step,
-                                        dtype=np.int32) + rr_start
-                              ) % run_requests.size
-                run_requests = run_requests[rr_indices]
-                self._match_req_rr_cursor = rr_start + \
-                    self.max_match_reqs_per_step
-
-            effective_k = self.k
-            if (self.high_conc_req_threshold > 0
-                    and num_requests >= self.high_conc_req_threshold):
-                effective_k = min(self.k, self.high_conc_max_draft_tokens)
-
             default_window = self.search_window if self.search_window is not None \
                 else self.default_search_window
             use_window_backoff = (
@@ -363,7 +308,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
                         num_tokens_no_spec,
                         token_ids_cpu,
                         search_window=default_window,
-                        draft_k=effective_k,
+                        draft_k=self.k,
                     )
                 if run_requests_backoff.size > 0:
                     self.run_batch_match(
@@ -371,7 +316,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
                         num_tokens_no_spec,
                         token_ids_cpu,
                         search_window=self.no_match_backoff_window,
-                        draft_k=effective_k,
+                        draft_k=self.k,
                     )
             else:
                 self.run_batch_match(
@@ -379,7 +324,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
                     num_tokens_no_spec,
                     token_ids_cpu,
                     search_window=default_window,
-                    draft_k=effective_k,
+                    draft_k=self.k,
                 )
 
         draft_token_ids = self.materialize_draft_token_ids(
