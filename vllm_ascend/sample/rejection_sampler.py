@@ -401,47 +401,98 @@ def rejection_random_sample_pytorch(
 ):
     batch_size = output_token_ids.shape[0]
     bonus_token_ids = bonus_token_ids.squeeze(1)
-    cu_num_draft_tokens_cpu = cu_num_draft_tokens.to("cpu").tolist()
-    is_greedy_cpu = is_greedy.to("cpu").tolist()
+    device = output_token_ids.device
+    cu_num_draft_tokens = cu_num_draft_tokens.to(device=device, dtype=torch.long)
+    num_draft_tokens = torch.empty_like(cu_num_draft_tokens)
+    num_draft_tokens[0] = cu_num_draft_tokens[0]
+    if batch_size > 1:
+        num_draft_tokens[1:] = (cu_num_draft_tokens[1:]
+                                - cu_num_draft_tokens[:-1])
+    start_idx = cu_num_draft_tokens - num_draft_tokens
 
-    for req_idx in range(batch_size):
-        if is_greedy_cpu[req_idx]:
-            continue
+    if is_greedy is None:
+        random_req_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+    else:
+        random_req_mask = ~is_greedy
 
-        start_idx = 0 if req_idx == 0 else cu_num_draft_tokens_cpu[req_idx - 1]
-        end_idx = cu_num_draft_tokens_cpu[req_idx]
-        num_draft_tokens = end_idx - start_idx
+    zero_draft_random_mask = random_req_mask & (num_draft_tokens == 0)
+    if zero_draft_random_mask.any():
+        output_token_ids[zero_draft_random_mask, 0] = bonus_token_ids[
+            zero_draft_random_mask]
 
-        if num_draft_tokens == 0:
-            output_token_ids[req_idx, 0] = bonus_token_ids[req_idx]
-            continue
+    num_tokens = draft_token_ids.numel()
+    if num_tokens == 0:
+        return
 
-        row_slice = slice(start_idx, end_idx)
-        req_draft_token_ids = draft_token_ids[row_slice].to(torch.long)
-        req_target_probs = target_probs[row_slice].gather(
-            1, req_draft_token_ids.unsqueeze(1)).squeeze(1)
-        if IS_NGRAM:
-            req_draft_probs = torch.ones_like(req_target_probs)
-        else:
-            assert draft_probs is not None
-            req_draft_probs = draft_probs[row_slice].gather(
-                1, req_draft_token_ids.unsqueeze(1)).squeeze(1)
-        req_uniform_probs = uniform_probs[row_slice]
-        accept_mask = (req_draft_probs > 0) & \
-            (req_target_probs / req_draft_probs >= req_uniform_probs)
-        reject_mask = ~accept_mask
+    req_ids = torch.arange(batch_size, device=device, dtype=torch.long)
+    token_req_ids = torch.repeat_interleave(req_ids, num_draft_tokens)
+    token_positions = (torch.arange(num_tokens, device=device, dtype=torch.long)
+                       - start_idx[token_req_ids])
 
-        if reject_mask.any():
-            first_reject = int(torch.argmax(reject_mask.to(torch.int32)).item())
-            if first_reject > 0:
-                output_token_ids[req_idx,
-                                 :first_reject] = req_draft_token_ids[:first_reject]
-            output_token_ids[req_idx,
-                             first_reject] = recovered_token_ids[start_idx
-                                                                 + first_reject]
-        else:
-            output_token_ids[req_idx, :num_draft_tokens] = req_draft_token_ids
-            output_token_ids[req_idx, num_draft_tokens] = bonus_token_ids[req_idx]
+    token_is_random = random_req_mask[token_req_ids]
+    if not token_is_random.any():
+        return
+
+    req_draft_token_ids = draft_token_ids.to(torch.long)
+    req_target_probs = target_probs.gather(
+        1, req_draft_token_ids.unsqueeze(1)).squeeze(1)
+    if IS_NGRAM:
+        req_draft_probs = torch.ones_like(req_target_probs)
+    else:
+        assert draft_probs is not None
+        req_draft_probs = draft_probs.gather(1, req_draft_token_ids.unsqueeze(1)
+                                             ).squeeze(1)
+    accept_mask = ((req_draft_probs > 0)
+                   & (req_target_probs / req_draft_probs >= uniform_probs))
+    reject_mask = ~accept_mask
+
+    # Build compact [batch_size, max_spec_len] matrices to avoid per-request
+    # Python loops and per-step CPU synchronization in random rejection path.
+    draft_matrix = torch.full(
+        (batch_size, max_spec_len),
+        PLACEHOLDER_TOKEN_ID,
+        dtype=output_token_ids.dtype,
+        device=device,
+    )
+    draft_matrix[token_req_ids[token_is_random],
+                 token_positions[token_is_random]] = draft_token_ids[
+                     token_is_random]
+    reject_matrix = torch.zeros((batch_size, max_spec_len),
+                                dtype=torch.bool,
+                                device=device)
+    reject_matrix[token_req_ids[token_is_random],
+                  token_positions[token_is_random]] = reject_mask[token_is_random]
+
+    pos_matrix = torch.arange(max_spec_len,
+                              device=device).expand(batch_size, -1)
+    first_reject_pos, _ = torch.min(
+        torch.where(reject_matrix, pos_matrix, max_spec_len + 1), dim=1)
+    random_with_draft_mask = random_req_mask & (num_draft_tokens > 0)
+    has_reject_mask = random_with_draft_mask & (first_reject_pos
+                                                < num_draft_tokens)
+    no_reject_mask = random_with_draft_mask & ~has_reject_mask
+
+    copy_len = torch.zeros(batch_size, dtype=torch.long, device=device)
+    copy_len[has_reject_mask] = first_reject_pos[has_reject_mask]
+    copy_len[no_reject_mask] = num_draft_tokens[no_reject_mask]
+    if max_spec_len > 0:
+        copy_mask = ((torch.arange(max_spec_len, device=device).expand(
+            batch_size, -1) < copy_len.unsqueeze(1))
+                     & random_with_draft_mask.unsqueeze(1))
+        output_token_ids[:, :max_spec_len][copy_mask] = draft_matrix[copy_mask]
+
+    if has_reject_mask.any():
+        reject_rows = torch.where(has_reject_mask)[0]
+        reject_cols = first_reject_pos[reject_rows]
+        reject_token_idx = start_idx[reject_rows] + reject_cols
+        output_token_ids[reject_rows, reject_cols] = recovered_token_ids[
+            reject_token_idx]
+
+    if no_reject_mask.any():
+        accept_all_rows = torch.where(no_reject_mask)[0]
+        bonus_cols = num_draft_tokens[accept_all_rows]
+        output_token_ids[accept_all_rows,
+                         bonus_cols] = bonus_token_ids[accept_all_rows]
 
 
 def expand_pytorch(

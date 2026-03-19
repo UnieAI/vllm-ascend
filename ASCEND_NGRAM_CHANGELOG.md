@@ -144,7 +144,7 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 影響：降低「長序列 + 長時間無匹配」場景的 CPU 空轉，提升整體吞吐穩定度。
 狀態：已保留，並在下一個 commit 進一步強化為多步 backoff。
 
-## `(this commit)` - Extend no-match backoff to multi-step exponential policy
+## `600a3a18` - Extend no-match backoff to multi-step exponential policy
 背景：單步 backoff 在 sustained no-match 區間仍不夠積極，matcher 會過快回到每步嘗試，CPU 成本仍偏高。
 修改：
 1. 將「skip once」改為「可連續 skip N 步」的狀態機：
@@ -154,6 +154,22 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 3. 新增參數 `VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_MAX_STEPS`（預設 `4`）。
 影響：在連續無匹配期間顯著降低 matcher 觸發頻率，釋放 CPU 給排程與資料搬運，間接提高 GPU 可用工作密度。
 狀態：本次提交納入，後續依實測調整 max steps 與 min_len。
+
+## `(this commit)` - Vectorize random rejection path and reintroduce gated ngram matcher threading
+背景：實測顯示 decode 階段 GPU util 在 request 穩定流入後仍偏低，且 ngram 模式在中高併發吞吐明顯落後，指向 host 端仍有可見熱點。
+修改：
+1. `vllm_ascend/sample/rejection_sampler.py`：
+   - 將 `rejection_random_sample_pytorch` 從逐 request Python 迴圈改為張量化邏輯。
+   - 移除 `cu_num_draft_tokens.to(\"cpu\").tolist()` / `is_greedy.to(\"cpu\").tolist()` 等每步 CPU 同步。
+   - 用 `[batch_size, max_spec_len]` 的 compact matrix 計算 first-reject、prefix copy、bonus/recovered 寫回，減少大量小 kernel 與 Python 控制流。
+2. `vllm_ascend/spec_decode/ngram_proposer.py`：
+   - matcher thread 策略改為「小批次 1 thread，大批次才升多 thread」。
+   - 新增參數：
+     - `VLLM_ASCEND_NGRAM_NUMBA_THREADS`（預設依 CPU/TP 推導，最多 4）
+     - `VLLM_ASCEND_NGRAM_NUMBA_MIN_PARALLEL_REQS`（預設 `8`）
+   - 只在目標 thread 數改變時呼叫 `set_num_threads`，避免每步切換/還原帶來的固定成本。
+影響：降低 ngram+rejection 的 CPU 熱路徑與同步開銷，目標是提升 decode 階段持續 GPU util 與 16-concurrency 吞吐。
+狀態：本次提交納入，待你在目標機重測 1/16 concurrency 與 util 曲線。
 
 ## 目前狀態總結
 

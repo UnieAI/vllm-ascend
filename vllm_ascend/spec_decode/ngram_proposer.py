@@ -51,15 +51,26 @@ class NgramProposer(VllmNgramProposer, Proposer):
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         cpu_count = os.cpu_count()
         if cpu_count:
-            # Align with upstream vLLM default to avoid multi-thread overhead
-            # in decode critical path under moderate request sizes.
-            self.num_numba_thread_available = min(1, max(1, cpu_count // 2))
-            self.num_numba_thread_available = max(
-                1, self.num_numba_thread_available // max(1, tp_size))
+            default_numba_threads = min(
+                4, max(1,
+                       (cpu_count // 2) // max(1, tp_size)))
         else:
-            self.num_numba_thread_available = 1
-        # Pin numba thread count once to avoid per-step get/set thread churn.
-        set_num_threads(self.num_numba_thread_available)
+            default_numba_threads = 1
+        self.num_numba_thread_available = max(
+            1,
+            int(
+                os.environ.get("VLLM_ASCEND_NGRAM_NUMBA_THREADS",
+                               str(default_numba_threads))),
+        )
+        self.num_numba_min_parallel_reqs = max(
+            1,
+            int(
+                os.environ.get("VLLM_ASCEND_NGRAM_NUMBA_MIN_PARALLEL_REQS",
+                               "8")),
+        )
+        # Keep one thread for small batches and only switch when needed.
+        self._current_numba_threads = 1
+        set_num_threads(self._current_numba_threads)
         self.no_match_backoff_enabled = bool(
             int(os.environ.get("VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF", "1")))
         self.no_match_backoff_min_len = int(
@@ -145,6 +156,13 @@ class NgramProposer(VllmNgramProposer, Proposer):
         num_ngram_requests = len(valid_ngram_requests)
         if not num_ngram_requests:
             return
+        desired_threads = 1
+        if num_ngram_requests >= self.num_numba_min_parallel_reqs:
+            desired_threads = min(self.num_numba_thread_available,
+                                  num_ngram_requests)
+        if desired_threads != self._current_numba_threads:
+            set_num_threads(desired_threads)
+            self._current_numba_threads = desired_threads
 
         batch_propose_numba(
             valid_ngram_requests,
