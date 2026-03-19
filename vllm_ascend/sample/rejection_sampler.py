@@ -17,6 +17,8 @@ GREEDY_TEMPERATURE = -1
 MAX_SPEC_LEN = 32
 
 _SCATTER_REDUCE_AMIN_SUPPORTED: Optional[bool] = None
+_NGRAM_ACCEPT_USE_FP32_LOGITS = bool(
+    int(os.environ.get("VLLM_ASCEND_NGRAM_ACCEPT_USE_FP32_LOGITS", "1")))
 
 
 def _compute_first_reject_pos(
@@ -225,6 +227,7 @@ def rejection_sample_ngram_from_logits(
         sampling_metadata.generators,
         device,
     )
+    uniform_probs = uniform_probs.to(torch.float32)
 
     cu_num_draft_tokens = cu_num_draft_tokens.to(device=device, dtype=torch.long)
     num_draft_tokens_tensor = torch.empty_like(cu_num_draft_tokens)
@@ -252,11 +255,15 @@ def rejection_sample_ngram_from_logits(
         return output_token_ids
 
     draft_ids_long = draft_token_ids.to(torch.long)
-    logits_fp32 = target_logits.to(torch.float32)
-    draft_logits = logits_fp32.gather(1, draft_ids_long.unsqueeze(1)).squeeze(1)
-    log_denom = torch.logsumexp(logits_fp32, dim=1)
+    logits_for_accept = target_logits
+    if _NGRAM_ACCEPT_USE_FP32_LOGITS and target_logits.dtype != torch.float32:
+        logits_for_accept = target_logits.to(torch.float32)
+    draft_logits = logits_for_accept.gather(1,
+                                            draft_ids_long.unsqueeze(1)).squeeze(1)
+    log_denom = torch.logsumexp(logits_for_accept, dim=1)
     log_uniform = torch.log(
-        uniform_probs.clamp_min(torch.finfo(uniform_probs.dtype).tiny))
+        uniform_probs.to(log_denom.dtype).clamp_min(
+            torch.finfo(log_denom.dtype).tiny))
     accept_mask = (draft_logits - log_denom) >= log_uniform
     reject_mask = ~accept_mask
 
@@ -382,6 +389,7 @@ def rejection_sample(
         sampling_metadata.generators,
         device,
     )
+    uniform_probs = uniform_probs.to(torch.float32)
 
     # Sample recovered tokens for each position.
     # [num_tokens]
@@ -655,6 +663,7 @@ def rejection_random_sample_pytorch(
         assert draft_probs is not None
         req_draft_probs = draft_probs.gather(1, req_draft_token_ids.unsqueeze(1)
                                              ).squeeze(1)
+    uniform_probs = uniform_probs.to(req_target_probs.dtype)
     accept_mask = ((req_draft_probs > 0)
                    & (req_target_probs / req_draft_probs >= uniform_probs))
     reject_mask = ~accept_mask

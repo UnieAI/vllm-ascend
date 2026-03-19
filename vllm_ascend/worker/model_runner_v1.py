@@ -370,21 +370,21 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                      MtpProposer]] = None
         self.ngram_batch_gate_min_reqs = max(
             1,
-            int(os.environ.get("VLLM_ASCEND_NGRAM_BATCH_GATE_MIN_REQS", "2")),
+            int(os.environ.get("VLLM_ASCEND_NGRAM_BATCH_GATE_MIN_REQS", "4")),
         )
         self.ngram_batch_gate_min_coverage = min(
             1.0,
             max(
                 0.0,
                 float(os.environ.get(
-                    "VLLM_ASCEND_NGRAM_BATCH_GATE_MIN_COVERAGE", "0.0")),
+                    "VLLM_ASCEND_NGRAM_BATCH_GATE_MIN_COVERAGE", "0.25")),
             ),
         )
         self.ngram_batch_gate_min_avg_drafts = max(
             0.0,
             float(
                 os.environ.get("VLLM_ASCEND_NGRAM_BATCH_GATE_MIN_AVG_DRAFTS",
-                               "0.0")),
+                               "0.5")),
         )
         self.actual_seq_lengths_q: list[int] = []
         self.decode_token_per_req = 1
@@ -1697,7 +1697,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 attn_state = AscendAttentionState.SpecDecoding
         # Speculative decoding.
         elif np.all(num_valid_tokens == 1):
-            if self.speculative_config and self.speculative_config.method == 'deepseek_mtp':
+            if self.speculative_config:
                 attn_state = AscendAttentionState.SpecDecoding
             else:
                 attn_state = AscendAttentionState.ChunkedPrefill
@@ -2559,8 +2559,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     sin=self.sin,
                 )
                 attn_state = AscendAttentionState.DecodeOnly
-                if self.speculative_config and \
-                        self.speculative_config.method == "deepseek_mtp":
+                if self.speculative_config:
                     attn_state = AscendAttentionState.SpecDecoding
 
                 for attn_group in self.attn_groups[kv_cache_group_id]:

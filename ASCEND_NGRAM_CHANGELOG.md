@@ -269,3 +269,32 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 - 回退不合理的「按併發硬關閉」策略，恢復 ngram 在低併發場景的可用性。
 - 降低 rejection sampler 每步固定成本，目標是改善 decode 階段 NPU util 與 16-concurrency 吞吐。
 - 提供可控的 batch gate（預設關閉），後續可在目標機用環境變數做 A/B 微調。
+
+## `(this commit)` - 修正 ngram attn-state 路徑並降低 speculative 浮點/CPU 固定開銷
+背景：最新測試仍為 `56, 447`（1/16 concurrency），推測問題不只 proposer，而是 ngram decode 仍落在較重執行路徑。
+
+修改：
+1. `vllm_ascend/worker/model_runner_v1.py`
+   - 修正 `_build_attn_state`：當 `np.all(num_valid_tokens == 1)` 且存在 `speculative_config`（不只 `deepseek_mtp`）時，統一使用 `AscendAttentionState.SpecDecoding`，避免 ngram decode 被誤導到 `ChunkedPrefill`。
+   - 同步修正 `_build_dummy_attn_metadata` 的狀態選擇，保持圖捕獲/dummy metadata 路徑一致。
+   - 將 batch-quality gate 預設由「關閉」改為「低侵入開啟」：
+     - `VLLM_ASCEND_NGRAM_BATCH_GATE_MIN_REQS=4`
+     - `VLLM_ASCEND_NGRAM_BATCH_GATE_MIN_COVERAGE=0.25`
+     - `VLLM_ASCEND_NGRAM_BATCH_GATE_MIN_AVG_DRAFTS=0.5`
+   - 目的：當 draft 只覆蓋少量 request 時，避免整批進 speculative 重路徑拖慢吞吐。
+
+2. `vllm_ascend/sample/rejection_sampler.py`
+   - 將 `generate_uniform_probs` 產出的 `float64` uniform 直接降為 `float32` 後再參與接受判定，避免 NPU 上不必要的 double 精度算子成本。
+   - ngram logits 接受判定加入可控精度參數：
+     - `VLLM_ASCEND_NGRAM_ACCEPT_USE_FP32_LOGITS`（預設 `1`）
+   - 在 random rejection 路徑中，先將 `uniform_probs` 對齊到 `req_target_probs.dtype`，避免隱式升精度導致的額外成本。
+
+3. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - Numba thread 預設更保守以減少 host contention：
+     - 預設可用執行緒數改為 `1`
+     - `VLLM_ASCEND_NGRAM_NUMBA_TOKENS_THRESHOLD` 預設 `16384`（由 `8192` 提高）
+   - 目的：低/中併發時減少 matcher 執行緒切換與 CPU 爭用，改善 steady-state decode 連續性。
+
+影響：
+- 先修正路徑級問題（SpecDecoding vs ChunkedPrefill），再壓低 ngram speculative 的固定成本（float64/CPU contention）。
+- 預期改善 16-concurrency 下 decode 階段的 NPU util 與 throughput 下限，並避免「少量 draft 拖垮整批」。

@@ -57,7 +57,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
         cpu_count = os.cpu_count()
         if cpu_count:
             default_numba_threads = min(
-                4, max(1,
+                1, max(1,
                        (cpu_count // 2) // max(1, tp_size)))
         else:
             default_numba_threads = 1
@@ -71,7 +71,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
             1,
             int(
                 os.environ.get("VLLM_ASCEND_NGRAM_NUMBA_TOKENS_THRESHOLD",
-                               "8192")),
+                               "16384")),
         )
         # Keep one thread for small batches and only switch when needed.
         self._current_numba_threads = 1
