@@ -207,3 +207,17 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
    - 在 `max_gen_len > 1` 且 `logprobs` 不需要時，直接走 `_to_list + token filter` 快路徑，不再呼叫較重的 `rejection_sampler.parse_output()` 泛用解析流程。
    - 同步覆蓋 non-async 與 async+ngram proposer 兩條無 logprobs 路徑，降低每步 sampled token 解析成本。
 影響：降低 ngram proposer 每步 Python 迴圈成本，並壓縮 lazy-recover 在「少量 reject」場景的記憶體/算力開銷，目標是提升 steady-state decode throughput 與 GPU util。
+
+## `(this commit)` - Broader optimization batch: search-window policy, long-context backoff, and parse/lazy-recover overhead
+背景：最新量測 `1/16 concurrency = 56 / 445`、`util ≈ 37%`，顯示 NPU 仍長時間等 CPU 熱路徑。
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - 新增 `VLLM_ASCEND_NGRAM_DEFAULT_SEARCH_WINDOW`（預設 `2048`）：當未顯式設定 `prompt_lookup_window` 時，避免默認掃描全上下文。
+   - 新增長上下文 backoff 參數：
+     - `VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_LONG_CTX_THRESHOLD`（預設 `2048`）
+     - `VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_MAX_STEPS_LONG_CTX`（預設 `8`）
+   - 對 unmatched requests 依上下文長度套用不同 backoff 上限，降低長序列無匹配時的 matcher 觸發密度。
+2. `vllm_ascend/sample/rejection_sampler.py`
+   - lazy-recover helper 在 `sampling_metadata.generators` 為空時，不再做 reject-row CPU 索引/迴圈。
+   - 精簡 helper 參數與呼叫資料流，移除不再使用的 `num_draft_tokens` 傳遞。
+影響：目標是降低 proposer/rejection 兩個 CPU 熱點的固定成本，提高 steady-state util 與 16-concurrency 吞吐。

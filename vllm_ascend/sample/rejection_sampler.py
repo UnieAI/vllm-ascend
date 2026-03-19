@@ -259,7 +259,6 @@ def rejection_sample_ngram_from_logits(
             reject_token_idx=reject_token_idx,
             draft_token_ids=draft_token_ids,
             target_logits=target_logits,
-            num_draft_tokens=num_draft_tokens_tensor,
             sampling_metadata=sampling_metadata,
             vocab_size=vocab_size,
             device=device,
@@ -677,7 +676,6 @@ def rejection_random_sample_pytorch(
                 draft_token_ids=draft_token_ids,
                 draft_probs=draft_probs,
                 target_probs=target_probs,
-                num_draft_tokens=num_draft_tokens,
                 sampling_metadata=sampling_metadata,
                 vocab_size=vocab_size,
                 device=device,
@@ -702,7 +700,6 @@ def _sample_recovered_tokens_for_indices(
     draft_token_ids: torch.Tensor,
     draft_probs: Optional[torch.Tensor],
     target_probs: torch.Tensor,
-    num_draft_tokens: torch.Tensor,
     sampling_metadata: SamplingMetadata,
     vocab_size: int,
     device: torch.device,
@@ -718,12 +715,12 @@ def _sample_recovered_tokens_for_indices(
         device=device,
     )
     q.exponential_()
-    # first-reject is computed only for requests with >0 draft tokens.
-    reject_rows_cpu = reject_rows.detach().cpu().tolist()
-    for local_idx, req_idx in enumerate(reject_rows_cpu):
-        generator = sampling_metadata.generators.get(req_idx)
-        if generator is not None:
-            q[local_idx].exponential_(generator=generator)
+    if sampling_metadata.generators:
+        reject_rows_cpu = reject_rows.detach().cpu().tolist()
+        for local_idx, req_idx in enumerate(reject_rows_cpu):
+            generator = sampling_metadata.generators.get(req_idx)
+            if generator is not None:
+                q[local_idx].exponential_(generator=generator)
 
     target_slice = target_probs[reject_token_idx]
     q_slice = q[:, :vocab_size]
@@ -744,7 +741,6 @@ def _sample_recovered_tokens_from_logits_indices(
     reject_token_idx: torch.Tensor,
     draft_token_ids: torch.Tensor,
     target_logits: torch.Tensor,
-    num_draft_tokens: torch.Tensor,
     sampling_metadata: SamplingMetadata,
     vocab_size: int,
     device: torch.device,
@@ -759,11 +755,12 @@ def _sample_recovered_tokens_from_logits_indices(
         device=device,
     )
     q.exponential_()
-    reject_rows_cpu = reject_rows.detach().cpu().tolist()
-    for local_idx, req_idx in enumerate(reject_rows_cpu):
-        generator = sampling_metadata.generators.get(req_idx)
-        if generator is not None:
-            q[local_idx].exponential_(generator=generator)
+    if sampling_metadata.generators:
+        reject_rows_cpu = reject_rows.detach().cpu().tolist()
+        for local_idx, req_idx in enumerate(reject_rows_cpu):
+            generator = sampling_metadata.generators.get(req_idx)
+            if generator is not None:
+                q[local_idx].exponential_(generator=generator)
 
     log_q = torch.log(q[:, :vocab_size])
     logits_slice = target_logits[reject_token_idx].to(torch.float32)

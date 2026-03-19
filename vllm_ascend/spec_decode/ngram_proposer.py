@@ -39,6 +39,11 @@ class NgramProposer(VllmNgramProposer, Proposer):
             "prompt_lookup_window",
             None,
         )
+        self.default_search_window = max(
+            0,
+            int(os.environ.get("VLLM_ASCEND_NGRAM_DEFAULT_SEARCH_WINDOW",
+                               "2048")),
+        )
         self.k = vllm_config.speculative_config.num_speculative_tokens
         self.max_model_len = vllm_config.model_config.max_model_len
 
@@ -79,6 +84,20 @@ class NgramProposer(VllmNgramProposer, Proposer):
             os.environ.get("VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_MAX_STEPS", "4"))
         self.no_match_backoff_max_steps = max(1,
                                               self.no_match_backoff_max_steps)
+        self.no_match_backoff_long_ctx_threshold = max(
+            0,
+            int(
+                os.environ.get(
+                    "VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_LONG_CTX_THRESHOLD",
+                    "2048")),
+        )
+        self.no_match_backoff_max_steps_long_ctx = max(
+            self.no_match_backoff_max_steps,
+            int(
+                os.environ.get(
+                    "VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_MAX_STEPS_LONG_CTX",
+                    "8")),
+        )
         self.no_match_backoff_window = max(
             0,
             int(
@@ -188,7 +207,8 @@ class NgramProposer(VllmNgramProposer, Proposer):
             self.min_n,
             self.max_n,
             search_window if search_window is not None else
-            (self.search_window if self.search_window is not None else 0),
+            (self.search_window if self.search_window is not None
+             else self.default_search_window),
             self.max_model_len,
             self.k,
             self.valid_ngram_draft,
@@ -268,7 +288,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
         run_requests = valid_ngram_requests[run_mask]
         if run_requests.size > 0:
             default_window = self.search_window if self.search_window is not None \
-                else 0
+                else self.default_search_window
             use_window_backoff = (
                 self.no_match_backoff_enabled
                 and self.no_match_backoff_window > 0
@@ -322,10 +342,21 @@ class NgramProposer(VllmNgramProposer, Proposer):
                     exp = np.minimum(new_streak - 1, 10)
                     skip_steps = np.left_shift(
                         np.ones_like(exp, dtype=np.int32), exp)
-                    self._req_skip_match_steps[unmatched_reqs] = np.minimum(
-                        self.no_match_backoff_max_steps,
+                    max_steps = np.full_like(
                         skip_steps,
+                        self.no_match_backoff_max_steps,
+                        dtype=np.int32,
                     )
+                    if self.no_match_backoff_long_ctx_threshold > 0:
+                        unmatched_num_tokens = num_tokens_no_spec[unmatched_reqs]
+                        long_ctx_mask = \
+                            unmatched_num_tokens >= \
+                            self.no_match_backoff_long_ctx_threshold
+                        if long_ctx_mask.any():
+                            max_steps[long_ctx_mask] = \
+                                self.no_match_backoff_max_steps_long_ctx
+                    self._req_skip_match_steps[unmatched_reqs] = np.minimum(
+                        max_steps, skip_steps)
         return draft_token_ids
 
     def propose(self,
