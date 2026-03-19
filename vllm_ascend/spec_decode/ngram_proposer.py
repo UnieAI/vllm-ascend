@@ -79,8 +79,8 @@ class NgramProposer(VllmNgramProposer, Proposer):
             os.environ.get("VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_MAX_STEPS", "4"))
         self.no_match_backoff_max_steps = max(1,
                                               self.no_match_backoff_max_steps)
-        self._skip_match_steps_remaining = 0
-        self._no_match_streak = 0
+        self._req_skip_match_steps = np.zeros(max_num_seqs, dtype=np.int32)
+        self._req_no_match_streak = np.zeros(max_num_seqs, dtype=np.int32)
 
         warmup_num_reqs = min(8, max_num_seqs)
         warmup_model_len = min(
@@ -95,8 +95,8 @@ class NgramProposer(VllmNgramProposer, Proposer):
             np.zeros((warmup_num_reqs, warmup_model_len), dtype=np.int32),
             valid_ngram_requests=warmup_valid_ngram_requests,
         )
-        self._skip_match_steps_remaining = 0
-        self._no_match_streak = 0
+        self._req_skip_match_steps.fill(0)
+        self._req_no_match_streak.fill(0)
 
     def load_model(self, *args, **kwargs):
         # No model to load.
@@ -193,44 +193,66 @@ class NgramProposer(VllmNgramProposer, Proposer):
                       token_ids_cpu: np.ndarray) -> list[list[int]]:
         num_ngram_requests = len(valid_ngram_requests)
         if num_ngram_requests == 0:
-            self._skip_match_steps_remaining = 0
-            self._no_match_streak = 0
+            if num_requests > 0:
+                self._req_skip_match_steps[:num_requests] = 0
+                self._req_no_match_streak[:num_requests] = 0
             return [[] for _ in range(num_requests)]
 
-        max_tokens_in_batch = int(np.max(num_tokens_no_spec[valid_ngram_requests]))
-        if (self.no_match_backoff_enabled
-                and self._skip_match_steps_remaining > 0
-                and max_tokens_in_batch >= self.no_match_backoff_min_len):
-            self._skip_match_steps_remaining -= 1
-            return [[] for _ in range(num_requests)]
+        if self.no_match_backoff_enabled and num_requests > 0:
+            active_mask = np.zeros(num_requests, dtype=np.bool_)
+            active_mask[valid_ngram_requests] = True
+            inactive_indices = np.nonzero(~active_mask)[0]
+            if inactive_indices.size > 0:
+                self._req_skip_match_steps[inactive_indices] = 0
+                self._req_no_match_streak[inactive_indices] = 0
 
-        self.run_batch_match(
-            valid_ngram_requests,
-            num_tokens_no_spec,
-            token_ids_cpu,
-        )
+        self.valid_ngram_num_drafts[valid_ngram_requests] = 0
+        run_mask = np.ones(num_ngram_requests, dtype=np.bool_)
+        if self.no_match_backoff_enabled:
+            for i, req_idx in enumerate(valid_ngram_requests):
+                num_tokens = int(num_tokens_no_spec[req_idx])
+                if num_tokens < self.no_match_backoff_min_len:
+                    self._req_skip_match_steps[req_idx] = 0
+                    self._req_no_match_streak[req_idx] = 0
+                    continue
+                remaining = int(self._req_skip_match_steps[req_idx])
+                if remaining > 0:
+                    self._req_skip_match_steps[req_idx] = remaining - 1
+                    run_mask[i] = False
+
+        run_requests = valid_ngram_requests[run_mask]
+        if run_requests.size > 0:
+            self.run_batch_match(
+                run_requests,
+                num_tokens_no_spec,
+                token_ids_cpu,
+            )
+
         draft_token_ids = self.materialize_draft_token_ids(
             num_requests,
             valid_ngram_requests,
         )
-        if self.no_match_backoff_enabled and \
-                max_tokens_in_batch >= self.no_match_backoff_min_len:
-            matched = np.any(
-                self.valid_ngram_num_drafts[valid_ngram_requests] > 0)
-            if matched:
-                self._no_match_streak = 0
-                self._skip_match_steps_remaining = 0
-            else:
-                self._no_match_streak += 1
-                # Exponential backoff for sustained no-match periods.
-                backoff_steps = min(
+        if self.no_match_backoff_enabled:
+            skipped_mask = ~run_mask
+            for i, req_idx in enumerate(valid_ngram_requests):
+                num_tokens = int(num_tokens_no_spec[req_idx])
+                if num_tokens < self.no_match_backoff_min_len:
+                    self._req_skip_match_steps[req_idx] = 0
+                    self._req_no_match_streak[req_idx] = 0
+                    continue
+                if skipped_mask[i]:
+                    # Already skipped by request-local backoff this step.
+                    continue
+                if self.valid_ngram_num_drafts[req_idx] > 0:
+                    self._req_skip_match_steps[req_idx] = 0
+                    self._req_no_match_streak[req_idx] = 0
+                    continue
+                streak = int(self._req_no_match_streak[req_idx]) + 1
+                self._req_no_match_streak[req_idx] = streak
+                self._req_skip_match_steps[req_idx] = min(
                     self.no_match_backoff_max_steps,
-                    1 << min(self._no_match_streak - 1, 10),
+                    1 << min(streak - 1, 10),
                 )
-                self._skip_match_steps_remaining = backoff_steps
-        else:
-            self._skip_match_steps_remaining = 0
-            self._no_match_streak = 0
         return draft_token_ids
 
     def propose(self,
