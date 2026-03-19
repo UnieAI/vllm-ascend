@@ -64,9 +64,15 @@ class NgramProposer(VllmNgramProposer, Proposer):
             0,
             int(
                 os.environ.get("VLLM_ASCEND_NGRAM_MAX_MATCH_REQS_PER_STEP",
-                               "8")),
+                               "0")),
         )
         self._match_req_rr_cursor = 0
+        self.high_conc_disable_threshold = max(
+            0,
+            int(
+                os.environ.get(
+                    "VLLM_ASCEND_NGRAM_HIGH_CONC_DISABLE_THRESHOLD", "12")),
+        )
         self.max_model_len = vllm_config.model_config.max_model_len
 
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
@@ -273,6 +279,19 @@ class NgramProposer(VllmNgramProposer, Proposer):
                       valid_ngram_requests: np.ndarray,
                       num_tokens_no_spec: np.ndarray,
                       token_ids_cpu: np.ndarray) -> list[list[int]]:
+        if (self.high_conc_disable_threshold > 0
+                and num_requests >= self.high_conc_disable_threshold):
+            # Under high concurrency, ngram draft generation often becomes
+            # net-negative (CPU-bound matcher + verification overhead).
+            # Return empty drafts to fall back to normal decode cost.
+            if num_requests > 0:
+                self._ensure_request_backoff_state(num_requests)
+                self._req_skip_match_steps[:num_requests] = 0
+                self._req_no_match_streak[:num_requests] = 0
+                if valid_ngram_requests.size > 0:
+                    self.valid_ngram_num_drafts[valid_ngram_requests] = 0
+            return [[] for _ in range(num_requests)]
+
         self._ensure_request_backoff_state(num_requests)
         num_ngram_requests = len(valid_ngram_requests)
         if num_ngram_requests == 0:

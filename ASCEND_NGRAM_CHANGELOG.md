@@ -222,8 +222,12 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
      - `VLLM_ASCEND_NGRAM_HIGH_CONC_MAX_DRAFT_TOKENS`（預設 `2`）
      - 請求數達到 threshold 後，自動把每步 draft token 上限降到 2，降低 verify 計算負載。
    - 新增每步 matcher request 預算：
-     - `VLLM_ASCEND_NGRAM_MAX_MATCH_REQS_PER_STEP`（預設 `8`）
+     - `VLLM_ASCEND_NGRAM_MAX_MATCH_REQS_PER_STEP`（預設 `0`）
      - 以 round-robin 方式只對部分 request 跑 matcher，避免高併發每步全量匹配造成 CPU 壓力。
+   - 新增高併發自動停用門檻：
+     - `VLLM_ASCEND_NGRAM_HIGH_CONC_DISABLE_THRESHOLD`（預設 `12`）
+     - 當 batch request 數大於等於門檻時，proposer 直接回傳空 drafts，避免 ngram 在高併發下成為純 CPU 負擔。
+   - 將 `VLLM_ASCEND_NGRAM_MAX_MATCH_REQS_PER_STEP` 預設調整為 `0`（不啟用 request budget 限流，避免在中等併發誤限流）。
 2. `vllm_ascend/sample/rejection_sampler.py`
    - lazy-recover helper 在 `sampling_metadata.generators` 為空時，不再做 reject-row CPU 索引/迴圈。
    - 精簡 helper 參數與呼叫資料流，移除不再使用的 `num_draft_tokens` 傳遞。
