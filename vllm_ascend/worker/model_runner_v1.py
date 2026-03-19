@@ -2302,6 +2302,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # NOTE(woosuk): As an exception, when using PP, the scheduler sends
             # the sampled tokens back, because there's no direct communication
             # between the first-stage worker and the last-stage worker.
+            single_req_indices: list[int] = []
+            single_start_indices: list[int] = []
+            single_token_values: list[int] = []
+            single_req_ids: list[str] = []
             for req_idx in range(num_sampled_tokens):
                 if self.use_async_scheduling:
                     if require_valid_sampled_token_ids_for_proposer:
@@ -2315,19 +2319,36 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     continue
 
                 start_idx = self.input_batch.num_tokens_no_spec[req_idx]
-                end_idx = start_idx + len(sampled_ids)
+                sampled_len = len(sampled_ids)
+                end_idx = start_idx + sampled_len
                 assert end_idx <= self.model_config.max_model_len, (
                     "Sampled token IDs exceed the max model length. "
                     f"Total number of tokens: {end_idx} > max_model_len: "
                     f"{self.model_config.max_model_len}")
+                req_id = self.input_batch.req_ids[req_idx]
+                if sampled_len == 1:
+                    single_req_indices.append(req_idx)
+                    single_start_indices.append(int(start_idx))
+                    single_token_values.append(int(sampled_ids[0]))
+                    single_req_ids.append(req_id)
+                    continue
 
                 self.input_batch.token_ids_cpu[req_idx,
                                                start_idx:end_idx] = sampled_ids
                 self.input_batch.num_tokens_no_spec[req_idx] = end_idx
                 self.input_batch.num_tokens[req_idx] = end_idx
-                req_id = self.input_batch.req_ids[req_idx]
-                req_state = self.requests[req_id]
-                req_state.output_token_ids.extend(sampled_ids)
+                self.requests[req_id].output_token_ids.extend(sampled_ids)
+
+            if single_req_indices:
+                req_idx_arr = np.asarray(single_req_indices, dtype=np.int32)
+                start_idx_arr = np.asarray(single_start_indices, dtype=np.int32)
+                token_arr = np.asarray(single_token_values, dtype=np.int32)
+                self.input_batch.token_ids_cpu[req_idx_arr, start_idx_arr] = token_arr
+                end_idx_arr = start_idx_arr + 1
+                self.input_batch.num_tokens_no_spec[req_idx_arr] = end_idx_arr
+                self.input_batch.num_tokens[req_idx_arr] = end_idx_arr
+                for req_id, token in zip(single_req_ids, single_token_values):
+                    self.requests[req_id].output_token_ids.append(token)
 
             if self.speculative_config:
                 self._draft_token_ids = self.propose_draft_token_ids(

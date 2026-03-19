@@ -180,6 +180,9 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
      - `VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_WINDOW`（預設 `256`）
      - `VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_WINDOW_STREAK`（預設 `2`）
    - 只在目標 thread 數改變時呼叫 `set_num_threads`，避免每步切換/還原帶來的固定成本。
+3. `vllm_ascend/worker/model_runner_v1.py`：
+   - 將 execute_model 內「單 token 的 request」改為批次向量化 CPU 寫回（`token_ids_cpu` + `num_tokens_*`），減少逐 request 切片寫入開銷。
+   - 保留 multi-token 情境走原邏輯，兼顧正確性與熱路徑效能。
 影響：降低 ngram+rejection 的 CPU 熱路徑與同步開銷，目標是提升 decode 階段持續 GPU util 與 16-concurrency 吞吐。
 狀態：本次提交納入，待你在目標機重測 1/16 concurrency 與 util 曲線。
 
