@@ -42,9 +42,31 @@ class NgramProposer(VllmNgramProposer, Proposer):
         self.default_search_window = max(
             0,
             int(os.environ.get("VLLM_ASCEND_NGRAM_DEFAULT_SEARCH_WINDOW",
-                               "2048")),
+                               "1024")),
         )
         self.k = vllm_config.speculative_config.num_speculative_tokens
+        self.high_conc_req_threshold = max(
+            0,
+            int(
+                os.environ.get("VLLM_ASCEND_NGRAM_HIGH_CONC_REQ_THRESHOLD",
+                               "8")),
+        )
+        self.high_conc_max_draft_tokens = max(
+            1,
+            min(
+                self.k,
+                int(
+                    os.environ.get("VLLM_ASCEND_NGRAM_HIGH_CONC_MAX_DRAFT_TOKENS",
+                                   str(min(2, self.k)))),
+            ),
+        )
+        self.max_match_reqs_per_step = max(
+            0,
+            int(
+                os.environ.get("VLLM_ASCEND_NGRAM_MAX_MATCH_REQS_PER_STEP",
+                               "8")),
+        )
+        self._match_req_rr_cursor = 0
         self.max_model_len = vllm_config.model_config.max_model_len
 
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
@@ -185,7 +207,8 @@ class NgramProposer(VllmNgramProposer, Proposer):
                         valid_ngram_requests: np.ndarray,
                         num_tokens_no_spec: np.ndarray,
                         token_ids_cpu: np.ndarray,
-                        search_window: int | None = None) -> None:
+                        search_window: int | None = None,
+                        draft_k: int | None = None) -> None:
         num_ngram_requests = len(valid_ngram_requests)
         if not num_ngram_requests:
             return
@@ -210,7 +233,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
             (self.search_window if self.search_window is not None
              else self.default_search_window),
             self.max_model_len,
-            self.k,
+            (self.k if draft_k is None else draft_k),
             self.valid_ngram_draft,
             self.valid_ngram_num_drafts,
         )
@@ -287,6 +310,21 @@ class NgramProposer(VllmNgramProposer, Proposer):
 
         run_requests = valid_ngram_requests[run_mask]
         if run_requests.size > 0:
+            if self.max_match_reqs_per_step > 0 and \
+                    run_requests.size > self.max_match_reqs_per_step:
+                rr_start = self._match_req_rr_cursor % run_requests.size
+                rr_indices = (np.arange(self.max_match_reqs_per_step,
+                                        dtype=np.int32) + rr_start
+                              ) % run_requests.size
+                run_requests = run_requests[rr_indices]
+                self._match_req_rr_cursor = rr_start + \
+                    self.max_match_reqs_per_step
+
+            effective_k = self.k
+            if (self.high_conc_req_threshold > 0
+                    and num_requests >= self.high_conc_req_threshold):
+                effective_k = min(self.k, self.high_conc_max_draft_tokens)
+
             default_window = self.search_window if self.search_window is not None \
                 else self.default_search_window
             use_window_backoff = (
@@ -306,6 +344,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
                         num_tokens_no_spec,
                         token_ids_cpu,
                         search_window=default_window,
+                        draft_k=effective_k,
                     )
                 if run_requests_backoff.size > 0:
                     self.run_batch_match(
@@ -313,6 +352,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
                         num_tokens_no_spec,
                         token_ids_cpu,
                         search_window=self.no_match_backoff_window,
+                        draft_k=effective_k,
                     )
             else:
                 self.run_batch_match(
@@ -320,6 +360,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
                     num_tokens_no_spec,
                     token_ids_cpu,
                     search_window=default_window,
+                    draft_k=effective_k,
                 )
 
         draft_token_ids = self.materialize_draft_token_ids(
@@ -327,7 +368,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
             valid_ngram_requests,
         )
         if self.no_match_backoff_enabled:
-            run_reqs = valid_ngram_requests[run_mask]
+            run_reqs = run_requests
             if run_reqs.size > 0:
                 matched_mask = self.valid_ngram_num_drafts[run_reqs] > 0
                 matched_reqs = run_reqs[matched_mask]

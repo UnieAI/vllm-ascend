@@ -212,11 +212,18 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 背景：最新量測 `1/16 concurrency = 56 / 445`、`util ≈ 37%`，顯示 NPU 仍長時間等 CPU 熱路徑。
 修改：
 1. `vllm_ascend/spec_decode/ngram_proposer.py`
-   - 新增 `VLLM_ASCEND_NGRAM_DEFAULT_SEARCH_WINDOW`（預設 `2048`）：當未顯式設定 `prompt_lookup_window` 時，避免默認掃描全上下文。
+   - 新增 `VLLM_ASCEND_NGRAM_DEFAULT_SEARCH_WINDOW`（預設 `1024`）：當未顯式設定 `prompt_lookup_window` 時，避免默認掃描全上下文。
    - 新增長上下文 backoff 參數：
      - `VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_LONG_CTX_THRESHOLD`（預設 `2048`）
      - `VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_MAX_STEPS_LONG_CTX`（預設 `8`）
    - 對 unmatched requests 依上下文長度套用不同 backoff 上限，降低長序列無匹配時的 matcher 觸發密度。
+   - 新增高併發下 draft 限流參數：
+     - `VLLM_ASCEND_NGRAM_HIGH_CONC_REQ_THRESHOLD`（預設 `8`）
+     - `VLLM_ASCEND_NGRAM_HIGH_CONC_MAX_DRAFT_TOKENS`（預設 `2`）
+     - 請求數達到 threshold 後，自動把每步 draft token 上限降到 2，降低 verify 計算負載。
+   - 新增每步 matcher request 預算：
+     - `VLLM_ASCEND_NGRAM_MAX_MATCH_REQS_PER_STEP`（預設 `8`）
+     - 以 round-robin 方式只對部分 request 跑 matcher，避免高併發每步全量匹配造成 CPU 壓力。
 2. `vllm_ascend/sample/rejection_sampler.py`
    - lazy-recover helper 在 `sampling_metadata.generators` 為空時，不再做 reject-row CPU 索引/迴圈。
    - 精簡 helper 參數與呼叫資料流，移除不再使用的 `num_draft_tokens` 傳遞。
