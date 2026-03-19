@@ -181,16 +181,22 @@ def rejection_sample(
 
     # Sample recovered tokens for each position.
     # [num_tokens]
-    recovered_token_ids = sample_recovered_tokens(
-        max_spec_len,
-        num_draft_tokens,
-        cu_num_draft_tokens,
-        draft_token_ids,
-        draft_probs,
-        target_probs,
-        sampling_metadata,
-        device,
+    lazy_recover_ngram = (
+        draft_probs is None
+        and bool(int(os.environ.get("VLLM_ASCEND_NGRAM_LAZY_RECOVER", "1")))
     )
+    recovered_token_ids = None
+    if not lazy_recover_ngram:
+        recovered_token_ids = sample_recovered_tokens(
+            max_spec_len,
+            num_draft_tokens,
+            cu_num_draft_tokens,
+            draft_token_ids,
+            draft_probs,
+            target_probs,
+            sampling_metadata,
+            device,
+        )
 
     # Rejection sampling for random sampling requests.
     rejection_random_sample_pytorch(
@@ -205,6 +211,7 @@ def rejection_sample(
         is_greedy,
         max_spec_len,
         vocab_size,
+        sampling_metadata=sampling_metadata,
         IS_NGRAM=draft_probs is None,
         # num_warps=1,
     )
@@ -398,6 +405,7 @@ def rejection_random_sample_pytorch(
     is_greedy,  # [batch_size]
     max_spec_len,
     vocab_size,
+    sampling_metadata: Optional[SamplingMetadata] = None,
     IS_NGRAM=False,
 ):
     batch_size = output_token_ids.shape[0]
@@ -486,14 +494,70 @@ def rejection_random_sample_pytorch(
         reject_rows = torch.where(has_reject_mask)[0]
         reject_cols = first_reject_pos[reject_rows]
         reject_token_idx = start_idx[reject_rows] + reject_cols
-        output_token_ids[reject_rows, reject_cols] = recovered_token_ids[
-            reject_token_idx]
+        if recovered_token_ids is None:
+            if sampling_metadata is None:
+                raise ValueError("sampling_metadata is required for lazy "
+                                 "recovered-token sampling.")
+            recovered_vals = _sample_recovered_tokens_for_indices(
+                reject_rows=reject_rows,
+                reject_token_idx=reject_token_idx,
+                draft_token_ids=draft_token_ids,
+                draft_probs=draft_probs,
+                target_probs=target_probs,
+                num_draft_tokens=num_draft_tokens,
+                sampling_metadata=sampling_metadata,
+                vocab_size=vocab_size,
+                device=device,
+                is_ngram=IS_NGRAM,
+            )
+            output_token_ids[reject_rows, reject_cols] = recovered_vals.to(
+                output_token_ids.dtype)
+        else:
+            output_token_ids[reject_rows, reject_cols] = recovered_token_ids[
+                reject_token_idx]
 
     if no_reject_mask.any():
         accept_all_rows = torch.where(no_reject_mask)[0]
         bonus_cols = num_draft_tokens[accept_all_rows]
         output_token_ids[accept_all_rows,
                          bonus_cols] = bonus_token_ids[accept_all_rows]
+
+
+def _sample_recovered_tokens_for_indices(
+    reject_rows: torch.Tensor,
+    reject_token_idx: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    draft_probs: Optional[torch.Tensor],
+    target_probs: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+    vocab_size: int,
+    device: torch.device,
+    is_ngram: bool,
+) -> torch.Tensor:
+    batch_size = num_draft_tokens.shape[0]
+    q = torch.empty(
+        (batch_size, vocab_size),
+        dtype=torch.float32,
+        device=device,
+    )
+    q.exponential_()
+    for i, generator in sampling_metadata.generators.items():
+        if i < batch_size and int(num_draft_tokens[i]) > 0:
+            q[i].exponential_(generator=generator)
+
+    target_slice = target_probs[reject_token_idx]
+    q_slice = q[reject_rows, :vocab_size]
+    if is_ngram:
+        reject_draft_ids = draft_token_ids[reject_token_idx].to(torch.long)
+        scores = target_slice / q_slice
+        row_ids = torch.arange(scores.shape[0], device=device)
+        scores[row_ids, reject_draft_ids] = float("-inf")
+    else:
+        assert draft_probs is not None
+        scores = (target_slice - draft_probs[reject_token_idx]).clamp_min(0)
+        scores = scores / q_slice
+    return torch.argmax(scores, dim=1)
 
 
 def expand_pytorch(
