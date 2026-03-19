@@ -2,82 +2,133 @@
 
 Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
-## Commit-by-commit changes
+以下整理 `93288799` 之後，和 Ascend ngram 問題定位/修復/效能優化直接相關的 commit。
+每條都包含：背景、實際修改、預期影響、後續狀態。
 
-1. `50f269d7` - Fix ngram proposer init before input batch is ready.
-   - Avoided early init path accessing `input_batch` before runner setup finished.
+## `50f269d7` - Fix ngram proposer init before input_batch is ready
+背景：啟動期 `NgramProposer` 可能早於 `runner.input_batch` 完成初始化，導致啟動階段 `AttributeError`。
+修改：調整 proposer 初始化/呼叫時序，避免在建構階段觸碰尚未可用的 `input_batch` 物件。
+影響：修掉「服務剛起來就炸」的啟動阻斷問題，讓 ngram 路徑可穩定進入執行期。
+狀態：此修正是後續所有 ngram 調優的前置條件，已保留。
 
-2. `f783e16e` - Fix async ngram proposer token flow and remove duplicate CPU writes.
-   - Corrected async token handoff path and removed duplicate `token_ids_cpu` updates.
+## `f783e16e` - Fix async ngram proposer token flow and remove duplicate CPU writes
+背景：async scheduling 下 token 流向和 CPU token buffer 更新存在重複/時序不一致，可能造成狀態污染與額外開銷。
+修改：修正 async 路徑的 sampled token 傳遞，移除重複寫入 `token_ids_cpu` 的邏輯。
+影響：降低 host 端無效工作，並減少 async 模式下 token state 不一致風險。
+狀態：已保留，屬於正確性+開銷雙向收益。
 
-3. `9ea3267a` - Add ngram runtime markers, accept-rate logs, and sync-path optimizations.
-   - Added startup/runtime/execute markers and acceptance diagnostics.
-   - Added initial sync-path reduction changes for sampled token handling.
+## `9ea3267a` - Add ngram runtime markers, accept-rate logs, and sync-path optimizations
+背景：當時無法確認是否真的跑進 Ascend ngram 路徑，也無法量化 proposal/accept 是否有效。
+修改：加入啟動標記、執行標記、accept-rate 與 propose/take-draft 等診斷日志，並附帶部分同步路徑優化。
+影響：大幅提升可觀測性，快速確認「有啟用但可能無 draft/無接受」的事實；但日志本身帶來明顯熱路徑負擔。
+狀態：後續已逐步移除高頻日志，只保留必要診斷能力。
 
-4. `35e5e569` - Raise ngram markers to warning and add propose call trace.
-   - Increased marker visibility in runtime logs.
-   - Added propose-call trace marker.
+## `35e5e569` - Raise ngram markers to warning and add propose call trace
+背景：INFO 級別在實際部署日誌中容易被淹沒，定位困難。
+修改：將關鍵 marker 提升到 warning，新增 propose call trace。
+影響：更容易從混雜日誌中確定執行分支；但 warning 級別高頻輸出會增加 I/O 壓力。
+狀態：屬於排障階段工具，後續已逐步降噪。
 
-5. `89e53b40` - Add ngram execute and draft handoff warning markers.
-   - Added explicit markers for execute step and draft handoff for runtime validation.
+## `89e53b40` - Add ngram execute and draft handoff warning markers
+背景：需要更細粒度地確認「sample 後 -> propose -> draft handoff」是否中間斷掉。
+修改：在 execute step 與 draft handoff 加 marker，覆蓋關鍵交界點。
+影響：能直接判斷 draft 是否產生、是否被帶到下一步；同時增加少量運行開銷。
+狀態：排障用途為主，非最終效能配置。
 
-6. `1e9288b0` - Align Ascend ngram request eligibility with upstream behavior.
-   - Synced request eligibility checks with upstream vLLM semantics.
+## `1e9288b0` - Align ascend ngram request eligibility with upstream behavior
+背景：Ascend 版本 request eligibility 判定和 upstream `vllm-origin` 有偏差，導致可提案請求被錯誤濾掉。
+修改：對齊 upstream 的 eligibility 規則，主要以 sampled ids 與長度邏輯為核心。
+影響：提升真正可參與 ngram proposal 的請求比例，避免「應該可提案卻被跳過」。
+狀態：後續又有 length/fallback 細修，此 commit 為主框架對齊。
 
-7. `623032ea` - Add ngram match stats warning logs for zero-draft diagnosis.
-   - Added per-step match stats to diagnose `matched_reqs=0` / `total_draft_tokens=0`.
+## `623032ea` - Add ngram match stats warning logs for zero-draft diagnosis
+背景：即使進入 proposer，仍常見 `non_empty_draft=0`，無法知道是 eligibility 空、還是 matcher 空。
+修改：增加 `valid_reqs / matched_reqs / total_draft_tokens` 的步級統計。
+影響：快速識別瓶頸位於「無有效請求」或「有有效請求但匹配失敗」。
+狀態：屬排障訊號，協助後續修正 eligibility 語義錯誤。
 
-8. `e30d165b` - Fix missing ngram match-log state initialization.
-   - Fixed missing internal counter/state that caused proposer runtime errors.
+## `e30d165b` - Fix missing ngram match-log state initialization
+背景：新增匹配統計後，`NgramProposer` 少初始化統計狀態，觸發 runtime `AttributeError`。
+修改：補齊缺失的成員初始化，確保 proposer 日誌狀態機完整。
+影響：修掉直接 crash 問題，恢復可觀測性工具可用。
+狀態：已保留。
 
-9. `01e241fd` - Fix ngram eligibility fallback and add empty-validation diagnostics.
-   - Added fallback path for token-length edge conditions.
-   - Added diagnostics when validation becomes empty.
+## `01e241fd` - Fix ngram eligibility fallback and add empty-validation diagnostics
+背景：在部分請求上出現 validation 全空，診斷顯示長度判斷與實際 request state 有落差。
+修改：加入 eligibility fallback，並新增 `ASCEND_NGRAM_VALIDATION_EMPTY` 等關鍵診斷輸出。
+影響：減少被誤判為不可提案的情況，並能看見空驗證時的長度參數。
+狀態：後續由 `1052d407` 再把 length semantics 收斂到更一致版本。
 
-10. `1052d407` - Fix ngram eligibility checks to use length semantics.
-    - Corrected request validity checks to use token length semantics consistently.
+## `1052d407` - Fix ngram eligibility checks to use length semantics
+背景：`num_tokens` 相關判斷混用了不同語義（含/不含 spec、快照/實際），造成 eligibility 漂移。
+修改：統一用 length semantics 進行 eligibility 檢查，減少語義歧義。
+影響：降低 valid_reqs 被錯殺，改善 draft 產生機率。
+狀態：目前仍是 ngram 產生穩定性的核心修正之一。
 
-11. `d96900bc` - Compat: support old rejection parse_output signature.
-    - Added compatibility for older `RejectionSampler.parse_output` function signatures.
+## `d96900bc` - Compat: support old rejection parse_output signature
+背景：不同環境/版本下 `RejectionSampler.parse_output` 參數簽名不一致，造成 `unexpected keyword` 錯誤。
+修改：加入 signature 相容分支（支援有/無 `logprobs_tensors` 參數）。
+影響：解掉 500 錯誤與每步 fallback 例外；提高跨版本可運行性。
+狀態：已保留。
 
-12. `165d9c67` - Reduce ngram debug overhead and optimize sampled-token tolist path.
-    - Reduced high-frequency logging overhead.
-    - Added faster sampled-token tolist path (guarded path).
+## `165d9c67` - Reduce ngram debug overhead and optimize sampled-token tolist path
+背景：高頻 debug marker 與 `tolist()` 同步開銷在 decode 熱路徑非常貴。
+修改：降低高頻日志負擔；引入 sampled token `tolist` 快路徑（含 pinned buffer + event 同步機制）。
+影響：減少每步 host 同步延遲，改善高頻 token 回圈開銷。
+狀態：後續由 `8ca29c36` 補強類型安全。
 
-13. `8ca29c36` - Fix sampled token normalization and guard fast tolist path.
-    - Normalized sampled token structures to avoid detokenizer/type regressions.
-    - Strengthened guardrails for fast tolist path.
+## `8ca29c36` - Fix sampled token normalization and guard fast tolist path
+背景：快路徑下 sampled token 形態可能不是純 `list[list[int]]`，曾引發 detokenizer type error。
+修改：補 sampled token normalization，並在快路徑加入更嚴格 guard。
+影響：修掉 `StreamInput must be integer/list[int]` 類型問題，避免「快了但不穩」。
+狀態：已保留。
 
-14. `092baadd` - Remove accept-rate logs and reduce ngram decode overhead.
-    - Removed hot-path accept-rate logging overhead.
-    - Reduced decode-path runtime overhead for ngram mode.
+## `092baadd` - Remove accept-rate logs and reduce ngram decode overhead
+背景：accept-rate 日志雖有診斷價值，但對高併發 decode 形成顯著 I/O 與格式化成本。
+修改：移除 accept-rate 熱路徑日志；同步微調 ngram decode 開銷點。
+影響：降低日誌造成的吞吐損失，恢復較接近真實算子開銷的量測。
+狀態：已保留，作為效能測試基線。
 
-15. `1aec077a` - Avoid per-step parse_output exceptions in ngram path.
-    - Removed per-step signature exception overhead.
-    - Added one-time capability detection for parse_output kwargs support.
+## `1aec077a` - Avoid per-step parse_output exceptions in ngram path
+背景：每步透過 try/except 探測 parse signature，例外本身就造成可見 CPU 開銷。
+修改：改為啟動時一次性 `inspect.signature` 檢測並快取結果，熱路徑不再丟例外。
+影響：去除每步 Python 例外成本，提升 decode loop 穩定度。
+狀態：已保留。
 
-16. `5c75cefc` - Vectorize Ascend rejection sampler random path.
-    - Updated rejection-sampler hot path to reduce Python-loop overhead.
+## `5c75cefc` - Vectorize Ascend rejection sampler random path
+背景：`rejection_random_sample_pytorch` 與 recovered token 路徑存在大量 Python loop / `.item()` 操作。
+修改：將 random rejection 與 recovered token 計算改為批次向量化邏輯。
+影響：降低 Python 迴圈與 host 介入，理論上對中高併發更友善。
+狀態：作為後續版本回退/重做時的重要參考點。
 
-17. `e1169518` - Optimize ngram rejection path and numba matcher threading.
-    - Experimental optimization: ngram-specific rejection path and proposer thread strategy.
-    - Result: introduced throughput regression in user validation environment.
+## `e1169518` - Optimize ngram rejection path and numba matcher threading
+背景：嘗試進一步壓縮 ngram rejection 與 proposer CPU 路徑開銷。
+修改：引入 ngram 專用 rejection 分支與 proposer 多執行緒策略調整（含 thread 參數化）。
+影響：在目標驗證機實測出現回歸（例如 42/350、41/344），推測有額外同步或 CPU 爭用副作用。
+狀態：此 commit 被後續兩個 commit 部分/大部分回退。
 
-18. `384ce776` - Rollback ngram regression and skip rejection on zero-draft steps.
-    - Rolled back regression-prone rejection path changes.
-    - Added fast path: if `target_logits_indices` is empty (no draft tokens), skip rejection sampler.
+## `384ce776` - Rollback ngram regression and skip rejection on zero-draft steps
+背景：`e1169518` 導致吞吐下滑，需要先止血。
+修改：回退高風險 rejection 改動；新增 fast-path：若該步 `target_logits_indices` 為空（zero-draft），直接跳過 rejection sampler。
+影響：避免在「本步沒有 draft」時仍付出完整 spec/rejection 成本。
+狀態：已保留，屬於低風險收益修正。
 
-19. `b18c8551` - Rollback ngram proposer threading changes.
-    - Rolled back aggressive proposer thread behavior from `e1169518`.
+## `b18c8551` - Rollback ngram proposer threading changes
+背景：GPU 利用率低（20~40%）且吞吐偏低，懷疑 proposer 多執行緒策略造成 CPU 爭用/排程抖動。
+修改：回退 `e1169518` 對 proposer thread 的激進策略，恢復較保守行為。
+影響：降低 host 端 thread 抢占風險，讓解碼流程更穩定。
+狀態：已保留，作為當前保守基線。
 
-20. `e4cb56b3` - Vectorize expand_batch_to_tokens in rejection sampler.
-    - Replaced per-request Python expansion with `repeat_interleave` vectorization.
-    - This aligns better with upstream kernel-style expansion behavior.
+## `e4cb56b3` - Vectorize expand_batch_to_tokens in rejection sampler
+背景：`expand_batch_to_tokens` 原本逐 request 擴展，仍有 Python 級迴圈開銷。
+修改：改為 `repeat_interleave` 向量化實作，並保留 replace 語義。
+影響：減少 rejection sampler 內部的 host 端小迴圈成本，對高頻 decode 路徑更友善。
+狀態：已保留，屬於低風險微優化。
 
-## Notes
+## 目前狀態總結
 
-- `e1169518` was partially rolled back by `384ce776` and `b18c8551` due measured regression.
-- Current optimization direction focuses on:
-  - reducing host-side overhead when ngram drafts are sparse,
-  - minimizing Python hot-path work,
-  - preserving compatibility with upstream vLLM semantics.
+- 已確認曾引入回歸的主體是 `e1169518`，後續透過 `384ce776` + `b18c8551` 回退。
+- 目前方向改為「保守且可量測」：
+  1. 先移除明確回歸點。
+  2. 保留低風險向量化與 zero-draft fast-path。
+  3. 持續比對 upstream (`~/workspace/jeff/vllm-origin/vllm`) 的熱路徑語義與成本分佈。
