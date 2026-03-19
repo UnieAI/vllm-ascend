@@ -64,7 +64,12 @@ class NgramProposer(VllmNgramProposer, Proposer):
             int(os.environ.get("VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF", "1")))
         self.no_match_backoff_min_len = int(
             os.environ.get("VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_MIN_LEN", "256"))
-        self._skip_match_once = False
+        self.no_match_backoff_max_steps = int(
+            os.environ.get("VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_MAX_STEPS", "4"))
+        self.no_match_backoff_max_steps = max(1,
+                                              self.no_match_backoff_max_steps)
+        self._skip_match_steps_remaining = 0
+        self._no_match_streak = 0
 
         warmup_num_reqs = min(8, max_num_seqs)
         warmup_model_len = min(
@@ -79,7 +84,8 @@ class NgramProposer(VllmNgramProposer, Proposer):
             np.zeros((warmup_num_reqs, warmup_model_len), dtype=np.int32),
             valid_ngram_requests=warmup_valid_ngram_requests,
         )
-        self._skip_match_once = False
+        self._skip_match_steps_remaining = 0
+        self._no_match_streak = 0
 
     def load_model(self, *args, **kwargs):
         # No model to load.
@@ -169,13 +175,15 @@ class NgramProposer(VllmNgramProposer, Proposer):
                       token_ids_cpu: np.ndarray) -> list[list[int]]:
         num_ngram_requests = len(valid_ngram_requests)
         if num_ngram_requests == 0:
-            self._skip_match_once = False
+            self._skip_match_steps_remaining = 0
+            self._no_match_streak = 0
             return [[] for _ in range(num_requests)]
 
         max_tokens_in_batch = int(np.max(num_tokens_no_spec[valid_ngram_requests]))
-        if (self.no_match_backoff_enabled and self._skip_match_once
+        if (self.no_match_backoff_enabled
+                and self._skip_match_steps_remaining > 0
                 and max_tokens_in_batch >= self.no_match_backoff_min_len):
-            self._skip_match_once = False
+            self._skip_match_steps_remaining -= 1
             return [[] for _ in range(num_requests)]
 
         self.run_batch_match(
@@ -191,9 +199,20 @@ class NgramProposer(VllmNgramProposer, Proposer):
                 max_tokens_in_batch >= self.no_match_backoff_min_len:
             matched = np.any(
                 self.valid_ngram_num_drafts[valid_ngram_requests] > 0)
-            self._skip_match_once = not bool(matched)
+            if matched:
+                self._no_match_streak = 0
+                self._skip_match_steps_remaining = 0
+            else:
+                self._no_match_streak += 1
+                # Exponential backoff for sustained no-match periods.
+                backoff_steps = min(
+                    self.no_match_backoff_max_steps,
+                    1 << min(self._no_match_streak - 1, 10),
+                )
+                self._skip_match_steps_remaining = backoff_steps
         else:
-            self._skip_match_once = False
+            self._skip_match_steps_remaining = 0
+            self._no_match_streak = 0
         return draft_token_ids
 
     def propose(self,

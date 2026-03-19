@@ -125,6 +125,36 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 影響：減少 rejection sampler 內部的 host 端小迴圈成本，對高頻 decode 路徑更友善。
 狀態：已保留，屬於低風險微優化。
 
+## `6ee79336` - Reduce ngram CPU hot-path overhead in proposer and model runner
+背景：在高頻 decode 迴圈中，仍存在 proposer 與 runner 端可避免的 Python/numba 開銷，壓縮了 GPU 可持續吃到工作的時間。
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`：移除每步 `get_num_threads()/set_num_threads()` 調整；改為初始化時一次設定 numba threads。
+2. `vllm_ascend/spec_decode/ngram_proposer.py`：`generate_token_ids` 的 request 篩選改為 numpy 向量化，減少 Python list/comprehension 熱點。
+3. `vllm_ascend/worker/model_runner_v1.py`：非 async 熱路徑移除每步 sampled token normalize 判斷的額外分支成本。
+影響：減少 CPU 熱路徑固定成本，改善 proposer 每步耗時，讓 decode loop 更接近「模型計算主導」。
+狀態：已保留，為目前效能基線之一。
+
+## `20cb9ced` - Add no-match backoff to ngram proposer
+背景：當序列已長但 ngram matcher 連續數步無匹配時，仍每步完整執行 matcher 造成純 CPU 浪費，且對最終 token 產出沒有正收益。
+修改：
+1. 在 proposer 新增 no-match backoff 機制：若上一輪無匹配，下一輪可在長序列情境暫時跳過 matcher。
+2. 新增可調參數：
+   - `VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF`（預設 `1`）
+   - `VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_MIN_LEN`（預設 `256`）
+影響：降低「長序列 + 長時間無匹配」場景的 CPU 空轉，提升整體吞吐穩定度。
+狀態：已保留，並在下一個 commit 進一步強化為多步 backoff。
+
+## `(this commit)` - Extend no-match backoff to multi-step exponential policy
+背景：單步 backoff 在 sustained no-match 區間仍不夠積極，matcher 會過快回到每步嘗試，CPU 成本仍偏高。
+修改：
+1. 將「skip once」改為「可連續 skip N 步」的狀態機：
+   - `_skip_match_steps_remaining`
+   - `_no_match_streak`
+2. no-match 時採用 capped exponential backoff（1,2,4...）控制後續跳過步數；match 後立即重置 streak/backoff。
+3. 新增參數 `VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_MAX_STEPS`（預設 `4`）。
+影響：在連續無匹配期間顯著降低 matcher 觸發頻率，釋放 CPU 給排程與資料搬運，間接提高 GPU 可用工作密度。
+狀態：本次提交納入，後續依實測調整 max steps 與 min_len。
+
 ## 目前狀態總結
 
 - 已確認曾引入回歸的主體是 `e1169518`，後續透過 `384ce776` + `b18c8551` 回退。
