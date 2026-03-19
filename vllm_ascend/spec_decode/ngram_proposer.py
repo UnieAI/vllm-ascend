@@ -199,10 +199,13 @@ class NgramProposer(VllmNgramProposer, Proposer):
             self, num_requests: int,
             valid_ngram_requests: np.ndarray) -> list[list[int]]:
         draft_token_ids: list[list[int]] = [[] for _ in range(num_requests)]
-        for i in valid_ngram_requests:
-            if self.valid_ngram_num_drafts[i] > 0:
-                draft_token_ids[i] = self.valid_ngram_draft[
-                    i, :self.valid_ngram_num_drafts[i]].tolist()
+        if valid_ngram_requests.size == 0:
+            return draft_token_ids
+        matched_mask = self.valid_ngram_num_drafts[valid_ngram_requests] > 0
+        matched_requests = valid_ngram_requests[matched_mask]
+        for i in matched_requests:
+            draft_len = int(self.valid_ngram_num_drafts[i])
+            draft_token_ids[i] = self.valid_ngram_draft[i, :draft_len].tolist()
         return draft_token_ids
 
     def _ensure_request_backoff_state(self, num_requests: int) -> None:
@@ -245,17 +248,22 @@ class NgramProposer(VllmNgramProposer, Proposer):
 
         self.valid_ngram_num_drafts[valid_ngram_requests] = 0
         run_mask = np.ones(num_ngram_requests, dtype=np.bool_)
+        short_mask = np.zeros(num_ngram_requests, dtype=np.bool_)
         if self.no_match_backoff_enabled:
-            for i, req_idx in enumerate(valid_ngram_requests):
-                num_tokens = int(num_tokens_no_spec[req_idx])
-                if num_tokens < self.no_match_backoff_min_len:
-                    self._req_skip_match_steps[req_idx] = 0
-                    self._req_no_match_streak[req_idx] = 0
-                    continue
-                remaining = int(self._req_skip_match_steps[req_idx])
-                if remaining > 0:
-                    self._req_skip_match_steps[req_idx] = remaining - 1
-                    run_mask[i] = False
+            req_indices = valid_ngram_requests
+            token_counts = num_tokens_no_spec[req_indices]
+            short_mask = token_counts < self.no_match_backoff_min_len
+            if short_mask.any():
+                short_reqs = req_indices[short_mask]
+                self._req_skip_match_steps[short_reqs] = 0
+                self._req_no_match_streak[short_reqs] = 0
+
+            remaining = self._req_skip_match_steps[req_indices]
+            skip_now_mask = (~short_mask) & (remaining > 0)
+            if skip_now_mask.any():
+                skip_reqs = req_indices[skip_now_mask]
+                self._req_skip_match_steps[skip_reqs] -= 1
+            run_mask = (~short_mask) & (~skip_now_mask)
 
         run_requests = valid_ngram_requests[run_mask]
         if run_requests.size > 0:
@@ -299,26 +307,25 @@ class NgramProposer(VllmNgramProposer, Proposer):
             valid_ngram_requests,
         )
         if self.no_match_backoff_enabled:
-            skipped_mask = ~run_mask
-            for i, req_idx in enumerate(valid_ngram_requests):
-                num_tokens = int(num_tokens_no_spec[req_idx])
-                if num_tokens < self.no_match_backoff_min_len:
-                    self._req_skip_match_steps[req_idx] = 0
-                    self._req_no_match_streak[req_idx] = 0
-                    continue
-                if skipped_mask[i]:
-                    # Already skipped by request-local backoff this step.
-                    continue
-                if self.valid_ngram_num_drafts[req_idx] > 0:
-                    self._req_skip_match_steps[req_idx] = 0
-                    self._req_no_match_streak[req_idx] = 0
-                    continue
-                streak = int(self._req_no_match_streak[req_idx]) + 1
-                self._req_no_match_streak[req_idx] = streak
-                self._req_skip_match_steps[req_idx] = min(
-                    self.no_match_backoff_max_steps,
-                    1 << min(streak - 1, 10),
-                )
+            run_reqs = valid_ngram_requests[run_mask]
+            if run_reqs.size > 0:
+                matched_mask = self.valid_ngram_num_drafts[run_reqs] > 0
+                matched_reqs = run_reqs[matched_mask]
+                if matched_reqs.size > 0:
+                    self._req_skip_match_steps[matched_reqs] = 0
+                    self._req_no_match_streak[matched_reqs] = 0
+
+                unmatched_reqs = run_reqs[~matched_mask]
+                if unmatched_reqs.size > 0:
+                    new_streak = self._req_no_match_streak[unmatched_reqs] + 1
+                    self._req_no_match_streak[unmatched_reqs] = new_streak
+                    exp = np.minimum(new_streak - 1, 10)
+                    skip_steps = np.left_shift(
+                        np.ones_like(exp, dtype=np.int32), exp)
+                    self._req_skip_match_steps[unmatched_reqs] = np.minimum(
+                        self.no_match_backoff_max_steps,
+                        skip_steps,
+                    )
         return draft_token_ids
 
     def propose(self,

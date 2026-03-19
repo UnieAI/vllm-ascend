@@ -193,3 +193,14 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
   1. 先移除明確回歸點。
   2. 保留低風險向量化與 zero-draft fast-path。
   3. 持續比對 upstream (`~/workspace/jeff/vllm-origin/vllm`) 的熱路徑語義與成本分佈。
+
+## `(this commit)` - Further reduce proposer/backoff and lazy-recover hot-path CPU cost
+背景：在 16-concurrency 下仍看到 GPU util 未打滿，推測 decode loop 還有 request 級 Python 迴圈與不必要大張量配置。
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - 將 `batch_propose` 中 request-backoff 前後處理改成 numpy 向量化（含 short-request reset、skip-step decrement、run/match 後 streak/skip 更新）。
+   - `materialize_draft_token_ids` 先以向量化 mask 篩出 matched requests，再做最小化 `tolist()`。
+2. `vllm_ascend/sample/rejection_sampler.py`
+   - `lazy recover` 兩個 helper（機率路徑與 logits 路徑）改為只對 `reject_rows` 配置 `q`（`[num_reject, vocab]`），不再每步配置 `[batch_size, vocab]`。
+   - seeded RNG 也只針對實際 reject request 套用，避免無效 row 的 random 生成成本。
+影響：降低 ngram proposer 每步 Python 迴圈成本，並壓縮 lazy-recover 在「少量 reject」場景的記憶體/算力開銷，目標是提升 steady-state decode throughput 與 GPU util。
