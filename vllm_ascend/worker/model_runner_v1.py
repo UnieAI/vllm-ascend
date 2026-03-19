@@ -2029,6 +2029,16 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.sampled_token_ids_transfer_event.synchronize()
         return pinned.tolist()
 
+    def _fast_filter_sampled_token_ids(
+            self, sampled_token_ids: torch.Tensor,
+            vocab_size: int) -> list[list[int]]:
+        # Fast path for no-logprobs rejection output parsing. For ngram spec
+        # decode, max_gen_len is small, so direct Python filtering after one
+        # bulk copy is cheaper than generic parse_output path.
+        sampled_token_ids_list = self._to_list(sampled_token_ids)
+        return [[token for token in row if token != -1 and token < vocab_size]
+                for row in sampled_token_ids_list]
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -2242,12 +2252,20 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         logprobs_lists = logprobs_tensors.tolists()
                 else:
                     # Includes spec decode tokens.
-                    valid_sampled_token_ids, logprobs_lists = \
-                        self._parse_rejection_sampler_output(
-                        sampled_token_ids,
-                        self.input_batch.vocab_size,
-                        logprobs_tensors,
-                    )
+                    if logprobs_tensors is None:
+                        valid_sampled_token_ids = \
+                            self._fast_filter_sampled_token_ids(
+                                sampled_token_ids,
+                                self.input_batch.vocab_size,
+                            )
+                        logprobs_lists = None
+                    else:
+                        valid_sampled_token_ids, logprobs_lists = \
+                            self._parse_rejection_sampler_output(
+                                sampled_token_ids,
+                                self.input_batch.vocab_size,
+                                logprobs_tensors,
+                            )
                 # Mask out the sampled tokens that should not be sampled.
                 for i in discard_sampled_tokens_req_indices:
                     valid_sampled_token_ids[i].clear()
@@ -2260,12 +2278,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         valid_sampled_token_ids = self._to_list(
                             sampled_token_ids)
                     else:
-                        valid_sampled_token_ids, _ = \
-                            self._parse_rejection_sampler_output(
+                        valid_sampled_token_ids = \
+                            self._fast_filter_sampled_token_ids(
                                 sampled_token_ids,
                                 self.input_batch.vocab_size,
-                                None,
-                    )
+                            )
                     for i in discard_sampled_tokens_req_indices:
                         valid_sampled_token_ids[i].clear()
                 else:

@@ -203,4 +203,7 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 2. `vllm_ascend/sample/rejection_sampler.py`
    - `lazy recover` 兩個 helper（機率路徑與 logits 路徑）改為只對 `reject_rows` 配置 `q`（`[num_reject, vocab]`），不再每步配置 `[batch_size, vocab]`。
    - seeded RNG 也只針對實際 reject request 套用，避免無效 row 的 random 生成成本。
+3. `vllm_ascend/worker/model_runner_v1.py`
+   - 在 `max_gen_len > 1` 且 `logprobs` 不需要時，直接走 `_to_list + token filter` 快路徑，不再呼叫較重的 `rejection_sampler.parse_output()` 泛用解析流程。
+   - 同步覆蓋 non-async 與 async+ngram proposer 兩條無 logprobs 路徑，降低每步 sampled token 解析成本。
 影響：降低 ngram proposer 每步 Python 迴圈成本，並壓縮 lazy-recover 在「少量 reject」場景的記憶體/算力開銷，目標是提升 steady-state decode throughput 與 GPU util。
