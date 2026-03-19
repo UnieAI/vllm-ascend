@@ -192,24 +192,6 @@ def graph_capture(device: torch.device):
         yield graph_capture_context
 
 
-def _should_normalize_sampled_token_ids(sampled_token_ids: list[Any]) -> bool:
-    for row in sampled_token_ids:
-        if row is None:
-            return True
-        if isinstance(row, (int, np.integer, torch.Tensor, np.ndarray)):
-            return True
-        if not isinstance(row, list):
-            return True
-        if len(row) == 0:
-            continue
-        first = row[0]
-        if isinstance(first, list):
-            return True
-        if isinstance(first, (torch.Tensor, np.ndarray)):
-            return True
-    return False
-
-
 def _normalize_sampled_token_ids(
         sampled_token_ids: list[Any]) -> list[list[int]]:
     normalized: list[list[int]] = []
@@ -2269,9 +2251,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 # Mask out the sampled tokens that should not be sampled.
                 for i in discard_sampled_tokens_req_indices:
                     valid_sampled_token_ids[i].clear()
-                if _should_normalize_sampled_token_ids(valid_sampled_token_ids):
-                    valid_sampled_token_ids = _normalize_sampled_token_ids(
-                        valid_sampled_token_ids)
             else:
                 invalid_req_indices = list(discard_sampled_tokens_req_indices)
                 invalid_req_indices_set = set(invalid_req_indices)
@@ -2286,13 +2265,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                 sampled_token_ids,
                                 self.input_batch.vocab_size,
                                 None,
-                            )
+                    )
                     for i in discard_sampled_tokens_req_indices:
                         valid_sampled_token_ids[i].clear()
-                    if _should_normalize_sampled_token_ids(
-                            valid_sampled_token_ids):
-                        valid_sampled_token_ids = _normalize_sampled_token_ids(
-                            valid_sampled_token_ids)
                 else:
                     valid_sampled_token_ids = []
                     assert sampled_token_ids.shape[-1] == 1

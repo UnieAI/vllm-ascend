@@ -3,7 +3,7 @@ from typing import NamedTuple
 
 import numpy as np
 import torch
-from numba import get_num_threads, jit, njit, prange, set_num_threads
+from numba import jit, njit, prange, set_num_threads
 from vllm.config import CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.v1.spec_decode.ngram_proposer import \
@@ -48,7 +48,6 @@ class NgramProposer(VllmNgramProposer, Proposer):
         self.valid_ngram_num_drafts = np.zeros((max_num_seqs),
                                                dtype=np.int32)
 
-        self.num_tokens_threshold = 8192
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         cpu_count = os.cpu_count()
         if cpu_count:
@@ -59,6 +58,8 @@ class NgramProposer(VllmNgramProposer, Proposer):
                 1, self.num_numba_thread_available // max(1, tp_size))
         else:
             self.num_numba_thread_available = 1
+        # Pin numba thread count once to avoid per-step get/set thread churn.
+        set_num_threads(self.num_numba_thread_available)
 
         warmup_num_reqs = min(8, max_num_seqs)
         warmup_model_len = min(
@@ -133,17 +134,6 @@ class NgramProposer(VllmNgramProposer, Proposer):
         if not num_ngram_requests:
             return
 
-        original_num_numba_threads = get_num_threads()
-        total_tokens = int(np.sum(num_tokens_no_spec, dtype=np.int64))
-        if total_tokens >= self.num_tokens_threshold:
-            final_num_threads = max(
-                1, min(self.num_numba_thread_available, num_ngram_requests))
-            if final_num_threads != original_num_numba_threads:
-                set_num_threads(final_num_threads)
-        else:
-            if original_num_numba_threads != 1:
-                set_num_threads(1)
-
         batch_propose_numba(
             valid_ngram_requests,
             num_tokens_no_spec,
@@ -156,8 +146,6 @@ class NgramProposer(VllmNgramProposer, Proposer):
             self.valid_ngram_draft,
             self.valid_ngram_num_drafts,
         )
-        if get_num_threads() != original_num_numba_threads:
-            set_num_threads(original_num_numba_threads)
 
     def materialize_draft_token_ids(
             self, num_requests: int,
@@ -215,34 +203,43 @@ class NgramProposer(VllmNgramProposer, Proposer):
         num_tokens_no_spec = self.runner.input_batch.num_tokens_no_spec
         token_ids_cpu = self.runner.input_batch.token_ids_cpu
         req_ids = self.runner.input_batch.req_ids
-        valid_ngram_requests = np.empty(len(valid_sampled_token_ids),
-                                        dtype=np.int32)
-        num_valid_requests = 0
+        num_requests = len(valid_sampled_token_ids)
+        sampled_lens = np.fromiter((self._num_sampled_ids(ids)
+                                    for ids in valid_sampled_token_ids),
+                                   dtype=np.int32,
+                                   count=num_requests)
+        candidate_indices = np.nonzero(sampled_lens > 0)[0].astype(np.int32,
+                                                                    copy=False)
+        if candidate_indices.size == 0:
+            return self.batch_propose(
+                num_requests,
+                candidate_indices,
+                num_tokens_no_spec,
+                token_ids_cpu,
+            )
 
-        for i, sampled_ids in enumerate(valid_sampled_token_ids):
-            num_sampled_ids = self._num_sampled_ids(sampled_ids)
-            if not num_sampled_ids:
-                continue
-
-            num_tokens = int(num_tokens_no_spec[i])
-            if num_tokens >= self.max_model_len and i < len(req_ids):
+        over_limit_mask = num_tokens_no_spec[candidate_indices] >= \
+            self.max_model_len
+        if over_limit_mask.any() and len(req_ids) > 0:
+            over_limit_indices = candidate_indices[over_limit_mask]
+            for idx in over_limit_indices:
+                i = int(idx)
+                if i >= len(req_ids):
+                    continue
                 req_id = req_ids[i]
                 req_state = self.runner.requests.get(req_id)
-                if req_state is not None:
-                    req_state_tokens = int(req_state.num_tokens)
-                    if req_state_tokens < num_tokens:
-                        num_tokens = req_state_tokens
-                        num_tokens_no_spec[i] = req_state_tokens
+                if req_state is None:
+                    continue
+                req_state_tokens = int(req_state.num_tokens)
+                if req_state_tokens < int(num_tokens_no_spec[i]):
+                    num_tokens_no_spec[i] = req_state_tokens
 
-            if not self.should_propose_for_request(i, sampled_ids, num_tokens):
-                continue
-
-            valid_ngram_requests[num_valid_requests] = i
-            num_valid_requests += 1
+        valid_mask = num_tokens_no_spec[candidate_indices] < self.max_model_len
+        valid_ngram_requests = candidate_indices[valid_mask]
 
         return self.batch_propose(
-            len(valid_sampled_token_ids),
-            valid_ngram_requests[:num_valid_requests],
+            num_requests,
+            valid_ngram_requests,
             num_tokens_no_spec,
             token_ids_cpu,
         )
