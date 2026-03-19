@@ -162,6 +162,8 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
    - 將 `rejection_random_sample_pytorch` 從逐 request Python 迴圈改為張量化邏輯。
    - 移除 `cu_num_draft_tokens.to(\"cpu\").tolist()` / `is_greedy.to(\"cpu\").tolist()` 等每步 CPU 同步。
    - 用 `[batch_size, max_spec_len]` 的 compact matrix 計算 first-reject、prefix copy、bonus/recovered 寫回，減少大量小 kernel 與 Python 控制流。
+   - 將 `sample_recovered_tokens_pytorch` 改為 token-chunk 向量化（取代逐 request 迴圈），降低 host dispatch 開銷並控制峰值記憶體。
+   - 新增 `VLLM_ASCEND_RECOVER_CHUNK_TOKENS`（預設 `64`）調整 recovered 路徑的 chunk 大小。
 2. `vllm_ascend/spec_decode/ngram_proposer.py`：
    - matcher thread 策略改為「小批次 1 thread，大批次才升多 thread」。
    - 新增參數：

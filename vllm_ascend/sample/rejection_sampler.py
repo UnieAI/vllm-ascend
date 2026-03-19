@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
 from typing import Optional
 
 import torch
@@ -531,26 +532,39 @@ def sample_recovered_tokens_pytorch(
     IS_NGRAM=False,
 ):
     batch_size = len(cu_num_draft_tokens)
-    cu_num_draft_tokens_cpu = cu_num_draft_tokens.to("cpu").tolist()
+    num_tokens = draft_token_ids.numel()
+    if num_tokens == 0:
+        return
 
-    for req_idx in range(batch_size):
-        start_idx = 0 if req_idx == 0 else cu_num_draft_tokens_cpu[req_idx - 1]
-        end_idx = cu_num_draft_tokens_cpu[req_idx]
-        if end_idx <= start_idx:
-            continue
+    device = target_probs.device
+    cu_num_draft_tokens = cu_num_draft_tokens.to(device=device, dtype=torch.long)
+    num_draft_tokens = torch.empty_like(cu_num_draft_tokens)
+    num_draft_tokens[0] = cu_num_draft_tokens[0]
+    if batch_size > 1:
+        num_draft_tokens[1:] = (cu_num_draft_tokens[1:]
+                                - cu_num_draft_tokens[:-1])
+    req_ids = torch.arange(batch_size, device=device, dtype=torch.long)
+    token_req_ids = torch.repeat_interleave(req_ids, num_draft_tokens)
 
-        row_slice = slice(start_idx, end_idx)
-        req_q = q[req_idx, :vocab_size]
+    # Keep peak memory bounded while still reducing per-request Python loops.
+    recover_chunk_tokens = max(
+        1, int(os.environ.get("VLLM_ASCEND_RECOVER_CHUNK_TOKENS", "64")))
+    for start in range(0, num_tokens, recover_chunk_tokens):
+        end = min(num_tokens, start + recover_chunk_tokens)
+        row_slice = slice(start, end)
+        req_chunk = token_req_ids[row_slice]
+        q_chunk = q[req_chunk, :vocab_size]
 
         if IS_NGRAM:
-            req_draft_token_ids = draft_token_ids[row_slice].to(torch.long)
-            scores = target_probs[row_slice] / req_q.unsqueeze(0)
-            row_ids = torch.arange(scores.shape[0], device=scores.device)
-            scores[row_ids, req_draft_token_ids] = float("-inf")
+            draft_chunk = draft_token_ids[row_slice].to(torch.long)
+            scores = target_probs[row_slice] / q_chunk
+            row_ids = torch.arange(end - start, device=device)
+            scores[row_ids, draft_chunk] = float("-inf")
         else:
             assert draft_probs is not None
-            scores = (target_probs[row_slice] - draft_probs[row_slice]).clamp_min(0)
-            scores = scores / req_q.unsqueeze(0)
+            scores = (target_probs[row_slice]
+                      - draft_probs[row_slice]).clamp_min(0)
+            scores = scores / q_chunk
 
         output_token_ids[row_slice] = torch.argmax(scores, dim=1)
 
