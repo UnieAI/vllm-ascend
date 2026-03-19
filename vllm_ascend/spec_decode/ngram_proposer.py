@@ -79,6 +79,18 @@ class NgramProposer(VllmNgramProposer, Proposer):
             os.environ.get("VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_MAX_STEPS", "4"))
         self.no_match_backoff_max_steps = max(1,
                                               self.no_match_backoff_max_steps)
+        self.no_match_backoff_window = max(
+            0,
+            int(
+                os.environ.get("VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_WINDOW",
+                               "256")),
+        )
+        self.no_match_backoff_window_streak = max(
+            1,
+            int(
+                os.environ.get(
+                    "VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_WINDOW_STREAK", "2")),
+        )
         self._req_skip_match_steps = np.zeros(max_num_seqs, dtype=np.int32)
         self._req_no_match_streak = np.zeros(max_num_seqs, dtype=np.int32)
 
@@ -150,9 +162,11 @@ class NgramProposer(VllmNgramProposer, Proposer):
 
         return valid_ngram_requests[:num_valid_requests]
 
-    def run_batch_match(self, valid_ngram_requests: np.ndarray,
+    def run_batch_match(self,
+                        valid_ngram_requests: np.ndarray,
                         num_tokens_no_spec: np.ndarray,
-                        token_ids_cpu: np.ndarray) -> None:
+                        token_ids_cpu: np.ndarray,
+                        search_window: int | None = None) -> None:
         num_ngram_requests = len(valid_ngram_requests)
         if not num_ngram_requests:
             return
@@ -173,7 +187,8 @@ class NgramProposer(VllmNgramProposer, Proposer):
             token_ids_cpu,
             self.min_n,
             self.max_n,
-            self.search_window if self.search_window is not None else 0,
+            search_window if search_window is not None else
+            (self.search_window if self.search_window is not None else 0),
             self.max_model_len,
             self.k,
             self.valid_ngram_draft,
@@ -244,11 +259,40 @@ class NgramProposer(VllmNgramProposer, Proposer):
 
         run_requests = valid_ngram_requests[run_mask]
         if run_requests.size > 0:
-            self.run_batch_match(
-                run_requests,
-                num_tokens_no_spec,
-                token_ids_cpu,
-            )
+            default_window = self.search_window if self.search_window is not None \
+                else 0
+            use_window_backoff = (
+                self.no_match_backoff_enabled
+                and self.no_match_backoff_window > 0
+                and (default_window == 0
+                     or default_window > self.no_match_backoff_window))
+            if use_window_backoff:
+                streaks = self._req_no_match_streak[run_requests]
+                backoff_window_mask = \
+                    streaks >= self.no_match_backoff_window_streak
+                run_requests_default = run_requests[~backoff_window_mask]
+                run_requests_backoff = run_requests[backoff_window_mask]
+                if run_requests_default.size > 0:
+                    self.run_batch_match(
+                        run_requests_default,
+                        num_tokens_no_spec,
+                        token_ids_cpu,
+                        search_window=default_window,
+                    )
+                if run_requests_backoff.size > 0:
+                    self.run_batch_match(
+                        run_requests_backoff,
+                        num_tokens_no_spec,
+                        token_ids_cpu,
+                        search_window=self.no_match_backoff_window,
+                    )
+            else:
+                self.run_batch_match(
+                    run_requests,
+                    num_tokens_no_spec,
+                    token_ids_cpu,
+                    search_window=default_window,
+                )
 
         draft_token_ids = self.materialize_draft_token_ids(
             num_requests,

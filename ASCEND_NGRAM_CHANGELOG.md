@@ -173,9 +173,12 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
    - matcher thread 策略改為「小批次 1 thread，大批次才升多 thread」。
    - no-match backoff 從「全 batch」改為「每個 request 各自退避」，避免少數無匹配請求拖慢整批 matcher。
    - 新增 request-backoff 狀態的 lazy-init / auto-grow 防呆，避免 patch 套用不完整時觸發 `_req_skip_match_steps` 缺失錯誤。
+   - 新增 no-match request 的動態 search-window 策略：對連續 no-match 的 request 使用較小 window 進行 matcher，避免每步掃完整上下文。
    - 新增參數：
      - `VLLM_ASCEND_NGRAM_NUMBA_THREADS`（預設依 CPU/TP 推導，最多 4）
      - `VLLM_ASCEND_NGRAM_NUMBA_MIN_PARALLEL_REQS`（預設 `8`）
+     - `VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_WINDOW`（預設 `256`）
+     - `VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_WINDOW_STREAK`（預設 `2`）
    - 只在目標 thread 數改變時呼叫 `set_num_threads`，避免每步切換/還原帶來的固定成本。
 影響：降低 ngram+rejection 的 CPU 熱路徑與同步開銷，目標是提升 decode 階段持續 GPU util 與 16-concurrency 吞吐。
 狀態：本次提交納入，待你在目標機重測 1/16 concurrency 與 util 曲線。
