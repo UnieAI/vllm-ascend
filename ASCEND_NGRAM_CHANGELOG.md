@@ -167,6 +167,7 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 2. `vllm_ascend/spec_decode/ngram_proposer.py`：
    - matcher thread 策略改為「小批次 1 thread，大批次才升多 thread」。
    - no-match backoff 從「全 batch」改為「每個 request 各自退避」，避免少數無匹配請求拖慢整批 matcher。
+   - 新增 request-backoff 狀態的 lazy-init / auto-grow 防呆，避免 patch 套用不完整時觸發 `_req_skip_match_steps` 缺失錯誤。
    - 新增參數：
      - `VLLM_ASCEND_NGRAM_NUMBA_THREADS`（預設依 CPU/TP 推導，最多 4）
      - `VLLM_ASCEND_NGRAM_NUMBA_MIN_PARALLEL_REQS`（預設 `8`）

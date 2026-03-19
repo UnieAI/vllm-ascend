@@ -156,6 +156,9 @@ class NgramProposer(VllmNgramProposer, Proposer):
         num_ngram_requests = len(valid_ngram_requests)
         if not num_ngram_requests:
             return
+        if not hasattr(self, "_current_numba_threads"):
+            self._current_numba_threads = 1
+            set_num_threads(self._current_numba_threads)
         desired_threads = 1
         if num_ngram_requests >= self.num_numba_min_parallel_reqs:
             desired_threads = min(self.num_numba_thread_available,
@@ -187,10 +190,29 @@ class NgramProposer(VllmNgramProposer, Proposer):
                     i, :self.valid_ngram_num_drafts[i]].tolist()
         return draft_token_ids
 
+    def _ensure_request_backoff_state(self, num_requests: int) -> None:
+        if not hasattr(self, "_req_skip_match_steps") \
+                or not hasattr(self, "_req_no_match_streak"):
+            max_reqs = self.valid_ngram_num_drafts.shape[0]
+            self._req_skip_match_steps = np.zeros(max_reqs, dtype=np.int32)
+            self._req_no_match_streak = np.zeros(max_reqs, dtype=np.int32)
+            return
+        current_size = self._req_skip_match_steps.shape[0]
+        if num_requests <= current_size:
+            return
+        new_size = max(num_requests, current_size * 2)
+        new_skip = np.zeros(new_size, dtype=np.int32)
+        new_streak = np.zeros(new_size, dtype=np.int32)
+        new_skip[:current_size] = self._req_skip_match_steps
+        new_streak[:current_size] = self._req_no_match_streak
+        self._req_skip_match_steps = new_skip
+        self._req_no_match_streak = new_streak
+
     def batch_propose(self, num_requests: int,
                       valid_ngram_requests: np.ndarray,
                       num_tokens_no_spec: np.ndarray,
                       token_ids_cpu: np.ndarray) -> list[list[int]]:
+        self._ensure_request_backoff_state(num_requests)
         num_ngram_requests = len(valid_ngram_requests)
         if num_ngram_requests == 0:
             if num_requests > 0:
