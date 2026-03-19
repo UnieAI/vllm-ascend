@@ -80,6 +80,21 @@ class AscendRejectionSampler(RejectionSampler, nn.Module):
                 A tensor containing the final output token IDs.
         '''
         assert metadata.max_spec_len <= MAX_SPEC_LEN
+        use_ngram_logits_fast_path = (
+            draft_probs is None
+            and bool(int(os.environ.get("VLLM_ASCEND_NGRAM_LOGITS_REJECTION",
+                                        "1")))
+        )
+        if use_ngram_logits_fast_path:
+            return rejection_sample_ngram_from_logits(
+                metadata.draft_token_ids,
+                metadata.num_draft_tokens,
+                metadata.max_spec_len,
+                metadata.cu_num_draft_tokens,
+                target_logits,
+                bonus_token_ids,
+                sampling_metadata,
+            )
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
         # `compute_probs` function.
@@ -100,6 +115,164 @@ class AscendRejectionSampler(RejectionSampler, nn.Module):
             sampling_metadata,
         )
         return output_token_ids
+
+
+def rejection_sample_ngram_from_logits(
+    # [num_tokens]
+    draft_token_ids: torch.Tensor,
+    # [batch_size]
+    num_draft_tokens: list[int],
+    max_spec_len: int,
+    # [batch_size]
+    cu_num_draft_tokens: torch.Tensor,
+    # [num_tokens, vocab_size]
+    target_logits: torch.Tensor,
+    # [batch_size, 1]
+    bonus_token_ids: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+) -> torch.Tensor:
+    assert draft_token_ids.ndim == 1
+    assert cu_num_draft_tokens.ndim == 1
+    assert target_logits.ndim == 2
+
+    batch_size = len(num_draft_tokens)
+    num_tokens = draft_token_ids.shape[0]
+    vocab_size = target_logits.shape[-1]
+    device = target_logits.device
+
+    output_token_ids = torch.full(
+        (batch_size, max_spec_len + 1),
+        PLACEHOLDER_TOKEN_ID,
+        dtype=torch.int32,
+        device=device,
+    )
+    bonus_token_ids = bonus_token_ids.squeeze(1)
+    if sampling_metadata.all_greedy:
+        is_greedy = None
+    else:
+        is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
+
+    if not sampling_metadata.all_random:
+        target_argmax = target_logits.argmax(dim=-1)
+        if min(num_draft_tokens) == 1 and max(
+                num_draft_tokens) == 1 and sampling_metadata.all_greedy:
+            rejection_greedy_sample_spec_len_1_pytorch(
+                output_token_ids,
+                draft_token_ids,
+                target_argmax,
+                bonus_token_ids.unsqueeze(1),
+            )
+        else:
+            rejection_greedy_sample_pytorch(
+                output_token_ids,
+                cu_num_draft_tokens,
+                draft_token_ids,
+                target_argmax,
+                bonus_token_ids.unsqueeze(1),
+                num_draft_tokens,
+                max_spec_len,
+                is_greedy,
+            )
+        if sampling_metadata.all_greedy:
+            return output_token_ids
+
+    uniform_probs = generate_uniform_probs(
+        num_tokens,
+        num_draft_tokens,
+        sampling_metadata.generators,
+        device,
+    )
+
+    cu_num_draft_tokens = cu_num_draft_tokens.to(device=device, dtype=torch.long)
+    num_draft_tokens_tensor = torch.empty_like(cu_num_draft_tokens)
+    num_draft_tokens_tensor[0] = cu_num_draft_tokens[0]
+    if batch_size > 1:
+        num_draft_tokens_tensor[1:] = (cu_num_draft_tokens[1:]
+                                       - cu_num_draft_tokens[:-1])
+    start_idx = cu_num_draft_tokens - num_draft_tokens_tensor
+    random_req_mask = torch.ones(batch_size, dtype=torch.bool,
+                                 device=device) if is_greedy is None else ~is_greedy
+    zero_draft_random_mask = random_req_mask & (num_draft_tokens_tensor == 0)
+    if zero_draft_random_mask.any():
+        output_token_ids[zero_draft_random_mask, 0] = bonus_token_ids[
+            zero_draft_random_mask]
+
+    if num_tokens == 0:
+        return output_token_ids
+
+    req_ids = torch.arange(batch_size, device=device, dtype=torch.long)
+    token_req_ids = torch.repeat_interleave(req_ids, num_draft_tokens_tensor)
+    token_positions = (torch.arange(num_tokens, device=device, dtype=torch.long)
+                       - start_idx[token_req_ids])
+    token_is_random = random_req_mask[token_req_ids]
+    if not token_is_random.any():
+        return output_token_ids
+
+    draft_ids_long = draft_token_ids.to(torch.long)
+    logits_fp32 = target_logits.to(torch.float32)
+    draft_logits = logits_fp32.gather(1, draft_ids_long.unsqueeze(1)).squeeze(1)
+    log_denom = torch.logsumexp(logits_fp32, dim=1)
+    log_uniform = torch.log(
+        uniform_probs.clamp_min(torch.finfo(uniform_probs.dtype).tiny))
+    accept_mask = (draft_logits - log_denom) >= log_uniform
+    reject_mask = ~accept_mask
+
+    draft_matrix = torch.full(
+        (batch_size, max_spec_len),
+        PLACEHOLDER_TOKEN_ID,
+        dtype=output_token_ids.dtype,
+        device=device,
+    )
+    draft_matrix[token_req_ids[token_is_random],
+                 token_positions[token_is_random]] = draft_token_ids[
+                     token_is_random]
+    reject_matrix = torch.zeros((batch_size, max_spec_len),
+                                dtype=torch.bool,
+                                device=device)
+    reject_matrix[token_req_ids[token_is_random],
+                  token_positions[token_is_random]] = reject_mask[token_is_random]
+
+    pos_matrix = torch.arange(max_spec_len,
+                              device=device).expand(batch_size, -1)
+    first_reject_pos, _ = torch.min(
+        torch.where(reject_matrix, pos_matrix, max_spec_len + 1), dim=1)
+    random_with_draft_mask = random_req_mask & (num_draft_tokens_tensor > 0)
+    has_reject_mask = random_with_draft_mask & (first_reject_pos
+                                                < num_draft_tokens_tensor)
+    no_reject_mask = random_with_draft_mask & ~has_reject_mask
+
+    copy_len = torch.zeros(batch_size, dtype=torch.long, device=device)
+    copy_len[has_reject_mask] = first_reject_pos[has_reject_mask]
+    copy_len[no_reject_mask] = num_draft_tokens_tensor[no_reject_mask]
+    if max_spec_len > 0:
+        copy_mask = ((torch.arange(max_spec_len, device=device).expand(
+            batch_size, -1) < copy_len.unsqueeze(1))
+                     & random_with_draft_mask.unsqueeze(1))
+        output_token_ids[:, :max_spec_len][copy_mask] = draft_matrix[copy_mask]
+
+    if has_reject_mask.any():
+        reject_rows = torch.where(has_reject_mask)[0]
+        reject_cols = first_reject_pos[reject_rows]
+        reject_token_idx = start_idx[reject_rows] + reject_cols
+        recovered_vals = _sample_recovered_tokens_from_logits_indices(
+            reject_rows=reject_rows,
+            reject_token_idx=reject_token_idx,
+            draft_token_ids=draft_token_ids,
+            target_logits=target_logits,
+            num_draft_tokens=num_draft_tokens_tensor,
+            sampling_metadata=sampling_metadata,
+            vocab_size=vocab_size,
+            device=device,
+        )
+        output_token_ids[reject_rows, reject_cols] = recovered_vals.to(
+            output_token_ids.dtype)
+
+    if no_reject_mask.any():
+        accept_all_rows = torch.where(no_reject_mask)[0]
+        bonus_cols = num_draft_tokens_tensor[accept_all_rows]
+        output_token_ids[accept_all_rows, bonus_cols] = bonus_token_ids[
+            accept_all_rows]
+    return output_token_ids
 
 
 def rejection_sample(
@@ -557,6 +730,36 @@ def _sample_recovered_tokens_for_indices(
         assert draft_probs is not None
         scores = (target_slice - draft_probs[reject_token_idx]).clamp_min(0)
         scores = scores / q_slice
+    return torch.argmax(scores, dim=1)
+
+
+def _sample_recovered_tokens_from_logits_indices(
+    reject_rows: torch.Tensor,
+    reject_token_idx: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    target_logits: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+    vocab_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    batch_size = num_draft_tokens.shape[0]
+    q = torch.empty(
+        (batch_size, vocab_size),
+        dtype=torch.float32,
+        device=device,
+    )
+    q.exponential_()
+    for i, generator in sampling_metadata.generators.items():
+        if i < batch_size and int(num_draft_tokens[i]) > 0:
+            q[i].exponential_(generator=generator)
+
+    log_q = torch.log(q[reject_rows, :vocab_size])
+    logits_slice = target_logits[reject_token_idx].to(torch.float32)
+    scores = logits_slice - log_q
+    reject_draft_ids = draft_token_ids[reject_token_idx].to(torch.long)
+    row_ids = torch.arange(scores.shape[0], device=device)
+    scores[row_ids, reject_draft_ids] = float("-inf")
     return torch.argmax(scores, dim=1)
 
 

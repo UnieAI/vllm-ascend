@@ -166,6 +166,9 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
    - 新增 `VLLM_ASCEND_RECOVER_CHUNK_TOKENS`（預設 `64`）調整 recovered 路徑的 chunk 大小。
    - 新增 ngram lazy recovered-token 路徑：不再先為所有 draft 位置計算 recovered token，改為僅在 request 發生 first-reject 時按需計算該位置。
    - 新增 `VLLM_ASCEND_NGRAM_LAZY_RECOVER`（預設 `1`）可切換回舊行為。
+   - 新增 ngram logits fast-path：在 ngram 情況下直接以 logits 計算 accept/reject（`logsumexp` + draft logit），避免先做全量 `compute_probs`。
+   - recovered token 在 fast-path 也改為僅對 first-reject 位置按需從 logits 計算。
+   - 新增 `VLLM_ASCEND_NGRAM_LOGITS_REJECTION`（預設 `1`）可切換回舊的概率路徑。
 2. `vllm_ascend/spec_decode/ngram_proposer.py`：
    - matcher thread 策略改為「小批次 1 thread，大批次才升多 thread」。
    - no-match backoff 從「全 batch」改為「每個 request 各自退避」，避免少數無匹配請求拖慢整批 matcher。
