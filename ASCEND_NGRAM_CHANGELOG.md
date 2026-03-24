@@ -326,3 +326,16 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 降低 decode 後處理（post process）中的 Python 熱點，提升 ngram 在中低併發下的 steady-state throughput 上限。
+
+## 2026-03-24 - 降低 rejection sampler seeded RNG 路徑的 Python 開銷
+背景：recovered-token 路徑在有 per-request generator 時，仍存在每步 `reject_rows -> cpu().tolist() -> dict.get()` 的高頻 Python 熱點。
+
+修改：
+1. `vllm_ascend/sample/rejection_sampler.py`
+   - 新增 `_apply_reject_row_generators_exponential` 共用 helper。
+   - 對 `sampling_metadata.generators` 建立並快取 req-index 映射，避免每步重複 hash lookup。
+   - 改用快取映射 + 單次 CPU tensor 迭代，替換每步 `tolist()` + `dict.get()` 迴圈。
+   - 套用到機率路徑與 logits 路徑的 recovered sampling helper。
+
+影響：
+- 在有 seeded generator 的 ngram rejection 情境下，降低 host 端 Python 管理成本，改善 16-concurrency 下的尾延遲與吞吐穩定度。

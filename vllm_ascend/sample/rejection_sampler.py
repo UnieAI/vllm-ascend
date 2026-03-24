@@ -62,6 +62,43 @@ def _compute_first_reject_pos(
     return first_reject_pos
 
 
+def _apply_reject_row_generators_exponential(
+    q: torch.Tensor,
+    reject_rows: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+) -> None:
+    generators = sampling_metadata.generators
+    if not generators:
+        return
+
+    cache_name = "_ascend_req_idx_to_generator"
+    req_to_generator = getattr(sampling_metadata, cache_name, None)
+    if req_to_generator is None:
+        max_req_idx = -1
+        for req_idx in generators.keys():
+            if isinstance(req_idx, int) and req_idx > max_req_idx:
+                max_req_idx = req_idx
+        req_to_generator = []
+        if max_req_idx >= 0:
+            req_to_generator = [None] * (max_req_idx + 1)
+            for req_idx, generator in generators.items():
+                if isinstance(req_idx,
+                              int) and 0 <= req_idx < len(req_to_generator):
+                    req_to_generator[req_idx] = generator
+        setattr(sampling_metadata, cache_name, req_to_generator)
+
+    reject_rows_cpu = reject_rows.detach().to(device="cpu")
+    for local_idx in range(reject_rows_cpu.shape[0]):
+        req_idx = int(reject_rows_cpu[local_idx])
+        generator = None
+        if req_to_generator and 0 <= req_idx < len(req_to_generator):
+            generator = req_to_generator[req_idx]
+        elif isinstance(generators, dict):
+            generator = generators.get(req_idx)
+        if generator is not None:
+            q[local_idx].exponential_(generator=generator)
+
+
 class AscendRejectionSampler(RejectionSampler, nn.Module):
     """
     The implementation strictly follows the algorithm described in
@@ -743,12 +780,8 @@ def _sample_recovered_tokens_for_indices(
         device=device,
     )
     q.exponential_()
-    if sampling_metadata.generators:
-        reject_rows_cpu = reject_rows.detach().cpu().tolist()
-        for local_idx, req_idx in enumerate(reject_rows_cpu):
-            generator = sampling_metadata.generators.get(req_idx)
-            if generator is not None:
-                q[local_idx].exponential_(generator=generator)
+    _apply_reject_row_generators_exponential(q, reject_rows,
+                                             sampling_metadata)
 
     target_slice = target_probs[reject_token_idx]
     q_slice = q[:, :vocab_size]
@@ -783,12 +816,8 @@ def _sample_recovered_tokens_from_logits_indices(
         device=device,
     )
     q.exponential_()
-    if sampling_metadata.generators:
-        reject_rows_cpu = reject_rows.detach().cpu().tolist()
-        for local_idx, req_idx in enumerate(reject_rows_cpu):
-            generator = sampling_metadata.generators.get(req_idx)
-            if generator is not None:
-                q[local_idx].exponential_(generator=generator)
+    _apply_reject_row_generators_exponential(q, reject_rows,
+                                             sampling_metadata)
 
     log_q = torch.log(q[:, :vocab_size])
     logits_slice = target_logits[reject_token_idx].to(torch.float32)
