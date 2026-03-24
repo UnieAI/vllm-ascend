@@ -2048,15 +2048,21 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         return moe_comm_type
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
+        sampled_token_ids_cpu = self._copy_sampled_token_ids_to_cpu(
+            sampled_token_ids)
+        return sampled_token_ids_cpu.tolist()
+
+    def _copy_sampled_token_ids_to_cpu(
+            self, sampled_token_ids: torch.Tensor) -> torch.Tensor:
         if not self.enable_fast_sampled_token_tolist:
-            return sampled_token_ids.tolist()
+            return sampled_token_ids.to("cpu")
 
         if sampled_token_ids.dim() != 2:
-            return sampled_token_ids.tolist()
+            return sampled_token_ids.to("cpu")
         assert self.sampled_token_ids_pinned_cpu is not None
         assert self.sampled_token_ids_transfer_event is not None
         if sampled_token_ids.shape[1] > self.sampled_token_ids_pinned_cpu.shape[1]:
-            return sampled_token_ids.tolist()
+            return sampled_token_ids.to("cpu")
 
         # Fast path (opt-in): use pinned host buffer and explicit event sync.
         pinned = self.sampled_token_ids_pinned_cpu[
@@ -2064,17 +2070,35 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         pinned.copy_(sampled_token_ids, non_blocking=True)
         self.sampled_token_ids_transfer_event.record()
         self.sampled_token_ids_transfer_event.synchronize()
-        return pinned.tolist()
+        return pinned
 
     def _fast_filter_sampled_token_ids(
             self, sampled_token_ids: torch.Tensor,
             vocab_size: int) -> list[list[int]]:
-        # Fast path for no-logprobs rejection output parsing. For ngram spec
-        # decode, max_gen_len is small, so direct Python filtering after one
-        # bulk copy is cheaper than generic parse_output path.
-        sampled_token_ids_list = self._to_list(sampled_token_ids)
-        return [[token for token in row if token != -1 and token < vocab_size]
-                for row in sampled_token_ids_list]
+        sampled_token_ids_cpu = self._copy_sampled_token_ids_to_cpu(
+            sampled_token_ids)
+        if sampled_token_ids_cpu.numel() == 0:
+            return [[] for _ in range(sampled_token_ids_cpu.shape[0])]
+
+        valid_mask = ((sampled_token_ids_cpu != -1)
+                      & (sampled_token_ids_cpu < vocab_size))
+        # Expected rejection output is a valid prefix followed by placeholders.
+        # Keep a fallback for unexpected sparse rows to preserve behavior.
+        is_prefix_mask = not torch.any((~valid_mask[:, :-1])
+                                       & valid_mask[:, 1:]).item()
+        if is_prefix_mask:
+            valid_counts = valid_mask.sum(dim=1, dtype=torch.int64).tolist()
+            sampled_token_ids_np = sampled_token_ids_cpu.numpy()
+            return [
+                sampled_token_ids_np[i, :valid_counts[i]].tolist()
+                for i in range(sampled_token_ids_np.shape[0])
+            ]
+
+        valid_sampled_token_ids: list[list[int]] = []
+        for i in range(sampled_token_ids_cpu.shape[0]):
+            row = sampled_token_ids_cpu[i][valid_mask[i]]
+            valid_sampled_token_ids.append(row.tolist())
+        return valid_sampled_token_ids
 
     @torch.inference_mode()
     def execute_model(

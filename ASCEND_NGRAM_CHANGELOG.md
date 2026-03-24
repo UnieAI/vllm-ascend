@@ -367,3 +367,18 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 修復服務啟動階段 `AttributeError: 'NgramProposer' object has no attribute 'no_match_backoff_enabled'`，恢復 ngram proposer 可用性。
+
+## 2026-03-24 - 優化 sampled-token 快速過濾路徑以降低 Python 遍歷成本
+背景：`max_gen_len > 1` 且無 logprobs 時，`_fast_filter_sampled_token_ids` 仍使用逐 token Python 過濾，16-concurrency 下會放大 post-process CPU 開銷。
+
+修改：
+1. `vllm_ascend/worker/model_runner_v1.py`
+   - 新增 `_copy_sampled_token_ids_to_cpu`，統一 sampled token 的 host copy 邏輯，避免重複 `tolist()` 路徑。
+   - `_to_list` 改為複用 `_copy_sampled_token_ids_to_cpu`，僅在最後一步做 `tolist()`。
+   - `_fast_filter_sampled_token_ids` 改為 tensor 化過濾：
+     - 先計算 `valid_mask`
+     - 對常見的「有效 token 為 prefix」場景，使用向量化 `valid_counts` + row slice 輸出
+     - 保留非 prefix fallback 以維持語義相容
+
+影響：
+- 降低 sampled token 解析熱路徑的 Python per-token 開銷，改善中低併發下的 decode post-process 吞吐。
