@@ -420,6 +420,19 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             0,
             int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_WARMUP", "8")),
         )
+        self.ngram_adaptive_soft_cap_enabled = bool(
+            int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_SOFT_CAP", "1")))
+        self.ngram_adaptive_soft_gain_threshold = max(
+            0.0,
+            float(
+                os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_SOFT_GAIN_THRESHOLD",
+                               "0.16")),
+        )
+        self.ngram_adaptive_soft_max_drafts = max(
+            1,
+            int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_SOFT_MAX_DRAFTS",
+                               "2")),
+        )
         self._ngram_adaptive_step = 0
         self._ngram_adaptive_gain_ema = 0.0
         self._ngram_adaptive_low_gain_streak = 0
@@ -1949,6 +1962,18 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 hidden_states, attn_metadata, aux_hidden_states)
             if (self.drafter.name == SpecDcodeType.NGRAM
                     and isinstance(draft_token_ids, list)):
+                if (self.ngram_adaptive_gate_enabled
+                        and self.ngram_adaptive_soft_cap_enabled
+                        and self._ngram_adaptive_step >
+                        self.ngram_adaptive_warmup_steps
+                        and self._ngram_adaptive_gain_ema <
+                        self.ngram_adaptive_soft_gain_threshold):
+                    soft_cap = min(self.ngram_adaptive_soft_max_drafts,
+                                   max(1, self.decode_token_per_req - 1))
+                    draft_token_ids = [
+                        row[:soft_cap] if len(row) > soft_cap else row
+                        for row in draft_token_ids
+                    ]
                 num_reqs = len(draft_token_ids)
                 if (num_reqs >= self.ngram_batch_gate_min_reqs and
                     (self.ngram_batch_gate_min_coverage > 0.0

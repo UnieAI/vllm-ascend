@@ -414,3 +414,18 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 在低收益 ngram 區間動態降載 proposer/rejection，目標是把 16-concurrency 吞吐從「長時間 CPU 受限」拉回更接近甚至超過 decode-only 基線。
+
+## 2026-03-24 - 自適應 soft draft cap（在低收益區間先降 draft 長度）
+背景：hard cooldown 雖可止損，但在邊界區間可能過於激進。希望在「收益偏低但未到停用」時先降低 draft 長度，減少 rejection 成本並保留部分 speculative 收益。
+
+修改：
+1. `vllm_ascend/worker/model_runner_v1.py`
+   - 新增 soft cap 參數（預設開啟）：
+     - `VLLM_ASCEND_NGRAM_ADAPTIVE_SOFT_CAP=1`
+     - `VLLM_ASCEND_NGRAM_ADAPTIVE_SOFT_GAIN_THRESHOLD=0.16`
+     - `VLLM_ASCEND_NGRAM_ADAPTIVE_SOFT_MAX_DRAFTS=2`
+   - 在 ngram proposer 產生 drafts 後，若 warmup 後 gain EMA 低於 soft threshold，則將每個 request 的 draft 長度裁到 `soft_max_drafts`。
+   - soft cap 與既有 batch-quality gate 串接，先削減 draft 成本再做 coverage/avg draft 檢查。
+
+影響：
+- 以較平滑策略降低低收益區間的 verify/rejection 負擔，目標在不完全停用 ngram 的情況下進一步提升 16-concurrency 吞吐。
