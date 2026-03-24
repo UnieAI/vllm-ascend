@@ -19,6 +19,8 @@ MAX_SPEC_LEN = 32
 _SCATTER_REDUCE_AMIN_SUPPORTED: Optional[bool] = None
 _NGRAM_ACCEPT_USE_FP32_LOGITS = bool(
     int(os.environ.get("VLLM_ASCEND_NGRAM_ACCEPT_USE_FP32_LOGITS", "1")))
+_NGRAM_FAST_RECOVER_ARGMAX = bool(
+    int(os.environ.get("VLLM_ASCEND_NGRAM_FAST_RECOVER_ARGMAX", "1")))
 
 
 def _compute_first_reject_pos(
@@ -774,24 +776,37 @@ def _sample_recovered_tokens_for_indices(
     if num_reject == 0:
         return torch.empty((0,), dtype=torch.long, device=device)
 
-    q = torch.empty(
-        (num_reject, vocab_size),
-        dtype=torch.float32,
-        device=device,
-    )
-    q.exponential_()
-    _apply_reject_row_generators_exponential(q, reject_rows,
-                                             sampling_metadata)
-
     target_slice = target_probs[reject_token_idx]
-    q_slice = q[:, :vocab_size]
     if is_ngram:
         reject_draft_ids = draft_token_ids[reject_token_idx].to(torch.long)
+        if _NGRAM_FAST_RECOVER_ARGMAX:
+            scores = target_slice.to(torch.float32)
+            row_ids = torch.arange(scores.shape[0], device=device)
+            scores[row_ids, reject_draft_ids] = float("-inf")
+            return torch.argmax(scores, dim=1)
+        q = torch.empty(
+            (num_reject, vocab_size),
+            dtype=torch.float32,
+            device=device,
+        )
+        q.exponential_()
+        _apply_reject_row_generators_exponential(q, reject_rows,
+                                                 sampling_metadata)
+        q_slice = q[:, :vocab_size]
         scores = target_slice / q_slice
         row_ids = torch.arange(scores.shape[0], device=device)
         scores[row_ids, reject_draft_ids] = float("-inf")
     else:
         assert draft_probs is not None
+        q = torch.empty(
+            (num_reject, vocab_size),
+            dtype=torch.float32,
+            device=device,
+        )
+        q.exponential_()
+        _apply_reject_row_generators_exponential(q, reject_rows,
+                                                 sampling_metadata)
+        q_slice = q[:, :vocab_size]
         scores = (target_slice - draft_probs[reject_token_idx]).clamp_min(0)
         scores = scores / q_slice
     return torch.argmax(scores, dim=1)
@@ -810,6 +825,13 @@ def _sample_recovered_tokens_from_logits_indices(
     if num_reject == 0:
         return torch.empty((0,), dtype=torch.long, device=device)
 
+    logits_slice = target_logits[reject_token_idx].to(torch.float32)
+    reject_draft_ids = draft_token_ids[reject_token_idx].to(torch.long)
+    if _NGRAM_FAST_RECOVER_ARGMAX:
+        row_ids = torch.arange(logits_slice.shape[0], device=device)
+        logits_slice[row_ids, reject_draft_ids] = float("-inf")
+        return torch.argmax(logits_slice, dim=1)
+
     q = torch.empty(
         (num_reject, vocab_size),
         dtype=torch.float32,
@@ -820,9 +842,7 @@ def _sample_recovered_tokens_from_logits_indices(
                                              sampling_metadata)
 
     log_q = torch.log(q[:, :vocab_size])
-    logits_slice = target_logits[reject_token_idx].to(torch.float32)
     scores = logits_slice - log_q
-    reject_draft_ids = draft_token_ids[reject_token_idx].to(torch.long)
     row_ids = torch.arange(scores.shape[0], device=device)
     scores[row_ids, reject_draft_ids] = float("-inf")
     return torch.argmax(scores, dim=1)

@@ -382,3 +382,17 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 降低 sampled token 解析熱路徑的 Python per-token 開銷，改善中低併發下的 decode post-process 吞吐。
+
+## 2026-03-24 - 引入 ngram fast recovered-token argmax 路徑（較大改動）
+背景：目前 ngram rejection 的 recovered-token 路徑在 reject rows 上仍包含 Gumbel 取樣（`q.exponential_` + `log(q)`）與 generator 處理，16-concurrency 下成本明顯。
+
+修改：
+1. `vllm_ascend/sample/rejection_sampler.py`
+   - 新增開關 `VLLM_ASCEND_NGRAM_FAST_RECOVER_ARGMAX`（預設 `1`）。
+   - 在 ngram recovered-token 路徑啟用 fast 模式時：
+     - 機率路徑：改為 `argmax(target_probs)`（排除 reject draft token）取 recovered token。
+     - logits 路徑：改為 `argmax(target_logits)`（排除 reject draft token）取 recovered token。
+   - fast 模式下跳過 reject-row 的 Gumbel 取樣與 per-request generator 套用，保留關閉開關可回到原隨機取樣行為。
+
+影響：
+- 這是偏吞吐導向的演算法級優化，目標是顯著降低 reject-row recovered sampling 的固定成本，改善 16-concurrency throughput。
