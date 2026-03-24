@@ -441,3 +441,20 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 純 NPU 算子路徑優化，目標是降低 ngram 接受判定的固定計算成本，提升 16-concurrency 吞吐與利用率。
+
+## 2026-03-24 - 暫緩動態 draft 預設並向量化 decode 後處理 CPU 熱路徑
+背景：目前目標改為先把 CPU/NPU 塞滿，不再預設啟用動態 draft 策略；另外 `execute_model` 中 discard 判斷與 accepted-token 回寫仍有每步 Python 逐項開銷。
+
+修改：
+1. `vllm_ascend/worker/model_runner_v1.py`
+   - 將動態 draft 相關預設改為關閉（仍可透過 env 開啟）：
+     - `VLLM_ASCEND_NGRAM_ADAPTIVE_GATE` 預設 `1 -> 0`
+     - `VLLM_ASCEND_NGRAM_ADAPTIVE_SOFT_CAP` 預設 `1 -> 0`
+   - `_update_states_after_model_execute` 的 `num_accepted_tokens` 回寫改為 numpy slice 指派，移除 per-request Python loop。
+   - `execute_model` 的 discard 判斷改為 numpy 向量化：
+     - 以 `num_computed_tokens_cpu + num_scheduled_tokens_np` 一次計算 `seq_lens`
+     - 用 `np.flatnonzero` 取得需 discard 的 request 索引
+     - 僅對 discard 索引執行 generator offset rewind
+
+影響：
+- 在不改變 rejection/proposer 演算法語義前提下，減少 decode post-process 的 Python 熱路徑開銷，並將預設路徑回到非動態 draft，便於後續專注 CPU/NPU 飽和優化。

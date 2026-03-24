@@ -390,7 +390,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # If recent speculative gain remains low, skip proposer for a few
         # steps to avoid paying proposer/rejection overhead continuously.
         self.ngram_adaptive_gate_enabled = bool(
-            int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_GATE", "1")))
+            int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_GATE", "0")))
         self.ngram_adaptive_gain_threshold = max(
             0.0,
             float(
@@ -421,7 +421,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_WARMUP", "8")),
         )
         self.ngram_adaptive_soft_cap_enabled = bool(
-            int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_SOFT_CAP", "1")))
+            int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_SOFT_CAP", "0")))
         self.ngram_adaptive_soft_gain_threshold = max(
             0.0,
             float(
@@ -720,8 +720,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                            device=output_token_ids.device),
             ],
             dim=1) == -1).int().argmax(-1).cpu().numpy()
-        for i, num_tokens in enumerate(num_accepted_tokens):
-            self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
+        self.input_batch.num_accepted_tokens_cpu[:num_accepted_tokens.shape[0]] = \
+            num_accepted_tokens
 
     def _use_aclgraph(self) -> bool:
         return self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and self.compilation_config.level == CompilationLevel.PIECEWISE and not self.model_config.enforce_eager
@@ -2360,21 +2360,33 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         self._update_states_after_model_execute(
                             sampler_output.sampled_token_ids)
 
+            num_reqs = self.input_batch.num_reqs
             discard_sampled_tokens_req_indices: list[int] = []
-            # TODO(woosuk): The following loop can be slow since it iterates over
-            # the requests one by one. Optimize.
-            discard_sampled_tokens_req_indices = []
-            for i, req_id in enumerate(self.input_batch.req_ids):
-                req_state = self.requests[req_id]
-                seq_len = (req_state.num_computed_tokens +
-                           scheduler_output.num_scheduled_tokens[req_id])
-                if seq_len < req_state.num_tokens:
+            discard_req_indices = np.empty((0, ), dtype=np.int32)
+            if num_reqs > 0:
+                req_target_num_tokens = np.fromiter(
+                    (int(self.requests[req_id].num_tokens)
+                     for req_id in self.input_batch.req_ids),
+                    dtype=np.int32,
+                    count=num_reqs,
+                )
+                seq_lens = (self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                            + num_scheduled_tokens_np[:num_reqs])
+                discard_req_indices = np.flatnonzero(
+                    seq_lens < req_target_num_tokens).astype(
+                        np.int32, copy=False)
+                discard_sampled_tokens_req_indices = \
+                    discard_req_indices.tolist()
+                if discard_req_indices.size > 0:
                     # Ignore the sampled token.
                     # Rewind the generator state as if the token was not sampled.
-                    generator = self.input_batch.generators.get(i)
-                    if generator is not None:
-                        generator.set_offset(generator.get_offset() - 4)
-                    discard_sampled_tokens_req_indices.append(i)
+                    generators = self.input_batch.generators
+                    if generators:
+                        for req_idx in discard_req_indices:
+                            generator = generators.get(int(req_idx))
+                            if generator is not None:
+                                generator.set_offset(
+                                    generator.get_offset() - 4)
 
             # Copy some objects so they don't get modified after returning.
             # This is important when using async scheduling.
