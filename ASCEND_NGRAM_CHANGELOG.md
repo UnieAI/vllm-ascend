@@ -312,3 +312,17 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 在不改外部 env 參數的前提下，降低 proposer 的 CPU 固定成本，提升中低併發下 ngram 路徑的實用吞吐。
+
+## 2026-03-24 - 批次化 model_runner multi-token 寫回路徑
+背景：spec decode 後的 sampled token 寫回流程仍包含逐 request 的 Python 切片寫入，16-concurrency 下會放大 host 端調度成本。
+
+修改：
+1. `vllm_ascend/worker/model_runner_v1.py`
+   - 將 `execute_model` 末段 token 寫回拆為 single-token / multi-token 兩條路徑：
+     - single-token 維持向量化批次寫回（加上向量化長度上界檢查）
+     - multi-token 改為「依 `sampled_len` 分組」後批次寫回 `token_ids_cpu`
+   - multi-token 路徑使用 grouped advanced indexing 一次寫入同長度 request，減少逐 request Python slice 賦值。
+   - `num_tokens_no_spec` / `num_tokens` 同步使用向量化陣列更新。
+
+影響：
+- 降低 decode 後處理（post process）中的 Python 熱點，提升 ngram 在中低併發下的 steady-state throughput 上限。

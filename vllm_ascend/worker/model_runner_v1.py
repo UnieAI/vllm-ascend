@@ -2360,6 +2360,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             single_start_indices: list[int] = []
             single_token_values: list[int] = []
             single_req_ids: list[str] = []
+            multi_req_indices: list[int] = []
+            multi_start_indices: list[int] = []
+            multi_sampled_ids: list[list[int]] = []
+            multi_req_ids: list[str] = []
             for req_idx in range(num_sampled_tokens):
                 if self.use_async_scheduling:
                     if require_valid_sampled_token_ids_for_proposer:
@@ -2387,22 +2391,63 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     single_req_ids.append(req_id)
                     continue
 
-                self.input_batch.token_ids_cpu[req_idx,
-                                               start_idx:end_idx] = sampled_ids
-                self.input_batch.num_tokens_no_spec[req_idx] = end_idx
-                self.input_batch.num_tokens[req_idx] = end_idx
-                self.requests[req_id].output_token_ids.extend(sampled_ids)
+                multi_req_indices.append(req_idx)
+                multi_start_indices.append(int(start_idx))
+                multi_sampled_ids.append(sampled_ids)
+                multi_req_ids.append(req_id)
 
             if single_req_indices:
                 req_idx_arr = np.asarray(single_req_indices, dtype=np.int32)
                 start_idx_arr = np.asarray(single_start_indices, dtype=np.int32)
                 token_arr = np.asarray(single_token_values, dtype=np.int32)
-                self.input_batch.token_ids_cpu[req_idx_arr, start_idx_arr] = token_arr
                 end_idx_arr = start_idx_arr + 1
+                assert np.all(end_idx_arr <= self.model_config.max_model_len), (
+                    "Sampled token IDs exceed the max model length. "
+                    f"Total number of tokens: {int(end_idx_arr.max())} > "
+                    f"max_model_len: {self.model_config.max_model_len}")
+                self.input_batch.token_ids_cpu[req_idx_arr, start_idx_arr] = token_arr
                 self.input_batch.num_tokens_no_spec[req_idx_arr] = end_idx_arr
                 self.input_batch.num_tokens[req_idx_arr] = end_idx_arr
                 for req_id, token in zip(single_req_ids, single_token_values):
                     self.requests[req_id].output_token_ids.append(token)
+
+            if multi_req_indices:
+                req_idx_arr = np.asarray(multi_req_indices, dtype=np.int32)
+                start_idx_arr = np.asarray(multi_start_indices, dtype=np.int32)
+                len_arr = np.fromiter((len(ids) for ids in multi_sampled_ids),
+                                      dtype=np.int32,
+                                      count=len(multi_sampled_ids))
+                end_idx_arr = start_idx_arr + len_arr
+                assert np.all(end_idx_arr <= self.model_config.max_model_len), (
+                    "Sampled token IDs exceed the max model length. "
+                    f"Total number of tokens: {int(end_idx_arr.max())} > "
+                    f"max_model_len: {self.model_config.max_model_len}")
+
+                unique_lens = np.unique(len_arr)
+                for curr_len in unique_lens.tolist():
+                    if curr_len <= 1:
+                        continue
+                    group_mask = len_arr == curr_len
+                    group_req_idx = req_idx_arr[group_mask]
+                    group_start_idx = start_idx_arr[group_mask]
+                    group_rows = np.flatnonzero(group_mask)
+                    group_tokens = np.asarray(
+                        [multi_sampled_ids[int(i)] for i in group_rows],
+                        dtype=np.int32,
+                    )
+                    row_idx = np.repeat(group_req_idx, curr_len)
+                    col_idx = (group_start_idx[:, None] +
+                               np.arange(curr_len, dtype=np.int32)[None, :]
+                               ).reshape(-1)
+                    self.input_batch.token_ids_cpu[row_idx,
+                                                   col_idx] = group_tokens.reshape(
+                                                       -1)
+                    group_end_idx = group_start_idx + curr_len
+                    self.input_batch.num_tokens_no_spec[group_req_idx] = group_end_idx
+                    self.input_batch.num_tokens[group_req_idx] = group_end_idx
+                    for local_idx, req_id_idx in enumerate(group_rows.tolist()):
+                        self.requests[multi_req_ids[req_id_idx]].output_token_ids.extend(
+                            group_tokens[local_idx].tolist())
 
             if self.speculative_config:
                 self._draft_token_ids = self.propose_draft_token_ids(
