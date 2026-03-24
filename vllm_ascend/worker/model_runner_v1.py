@@ -2364,20 +2364,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             discard_sampled_tokens_req_indices: list[int] = []
             discard_req_indices = np.empty((0, ), dtype=np.int32)
             if num_reqs > 0:
-                req_target_num_tokens = np.fromiter(
-                    (int(self.requests[req_id].num_tokens)
-                     for req_id in self.input_batch.req_ids),
-                    dtype=np.int32,
-                    count=num_reqs,
-                )
+                req_target_num_tokens = self.input_batch.num_tokens[:num_reqs]
                 seq_lens = (self.input_batch.num_computed_tokens_cpu[:num_reqs]
                             + num_scheduled_tokens_np[:num_reqs])
                 discard_req_indices = np.flatnonzero(
                     seq_lens < req_target_num_tokens).astype(
                         np.int32, copy=False)
-                discard_sampled_tokens_req_indices = \
-                    discard_req_indices.tolist()
                 if discard_req_indices.size > 0:
+                    discard_sampled_tokens_req_indices = \
+                        discard_req_indices.tolist()
                     # Ignore the sampled token.
                     # Rewind the generator state as if the token was not sampled.
                     generators = self.input_batch.generators

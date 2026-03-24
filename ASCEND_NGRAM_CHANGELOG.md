@@ -458,3 +458,14 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 在不改變 rejection/proposer 演算法語義前提下，減少 decode post-process 的 Python 熱路徑開銷，並將預設路徑回到非動態 draft，便於後續專注 CPU/NPU 飽和優化。
+
+## 2026-03-24 - discard 向量化路徑改為純 InputBatch 陣列比較（回歸修正）
+背景：上一輪將 discard 判斷向量化後，仍保留了 `req_id -> req_state.num_tokens` 的每步 Python 查表，可能抵消了向量化收益並造成吞吐回退。
+
+修改：
+1. `vllm_ascend/worker/model_runner_v1.py`
+   - `execute_model` 的 discard 條件比較改為直接使用 `self.input_batch.num_tokens[:num_reqs]`，移除每步 `np.fromiter(...)` + `self.requests[...]` 查表。
+   - 僅在 `discard_req_indices.size > 0` 時才建立 `discard_sampled_tokens_req_indices` list，避免空路徑不必要配置。
+
+影響：
+- 保持既有 discard 語義不變，降低 post-process 每步 CPU 開銷，目標修正 `56/683` 類型回退並恢復 16-concurrency 吞吐。
