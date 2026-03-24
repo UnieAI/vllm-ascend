@@ -469,3 +469,17 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 保持既有 discard 語義不變，降低 post-process 每步 CPU 開銷，目標修正 `56/683` 類型回退並恢復 16-concurrency 吞吐。
+
+## 2026-03-24 - proposer request 篩選改為可重用候選索引並移除 req_state 查表
+背景：`generate_token_ids` 每步都掃描 `valid_sampled_token_ids` 計算候選，且在 over-limit 校正時走 `req_id -> req_state` Python 查表，CPU 熱路徑成本偏高。
+
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - `generate_token_ids(...)` 新增可選參數：
+     - `sampled_token_lens`
+     - `candidate_indices`
+   - 若外部已提供候選索引，直接重用，避免 proposer 端重複掃描 sampled token list。
+   - over-limit 校正改為向量化 `np.minimum`，直接使用 `InputBatch.num_tokens` 陣列，移除 `req_state` 查表 loop。
+
+影響：
+- 不改 ngram 匹配演算法，僅降低 proposer Python 熱路徑開銷，為後續 async 輕量傳遞鋪路。

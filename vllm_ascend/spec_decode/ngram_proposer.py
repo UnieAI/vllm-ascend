@@ -413,17 +413,24 @@ class NgramProposer(VllmNgramProposer, Proposer):
                            num_scheduled_tokens=None,
                            hidden_states=None,
                            attn_metadata=None,
-                           aux_hidden_states=None) -> list[list[int]]:
+                           aux_hidden_states=None,
+                           sampled_token_lens: np.ndarray | None = None,
+                           candidate_indices: np.ndarray | None = None
+                           ) -> list[list[int]]:
         num_tokens_no_spec = self.runner.input_batch.num_tokens_no_spec
         token_ids_cpu = self.runner.input_batch.token_ids_cpu
-        req_ids = self.runner.input_batch.req_ids
+        num_tokens_snapshot = self.runner.input_batch.num_tokens
         num_requests = len(valid_sampled_token_ids)
-        sampled_lens = np.fromiter((self._num_sampled_ids(ids)
-                                    for ids in valid_sampled_token_ids),
-                                   dtype=np.int32,
-                                   count=num_requests)
-        candidate_indices = np.nonzero(sampled_lens > 0)[0].astype(np.int32,
-                                                                    copy=False)
+        if candidate_indices is None:
+            if sampled_token_lens is None:
+                sampled_token_lens = np.fromiter(
+                    (self._num_sampled_ids(ids)
+                     for ids in valid_sampled_token_ids),
+                    dtype=np.int32,
+                    count=num_requests,
+                )
+            candidate_indices = np.flatnonzero(sampled_token_lens > 0).astype(
+                np.int32, copy=False)
         if candidate_indices.size == 0:
             return self.batch_propose(
                 num_requests,
@@ -434,19 +441,12 @@ class NgramProposer(VllmNgramProposer, Proposer):
 
         over_limit_mask = num_tokens_no_spec[candidate_indices] >= \
             self.max_model_len
-        if over_limit_mask.any() and len(req_ids) > 0:
+        if over_limit_mask.any():
             over_limit_indices = candidate_indices[over_limit_mask]
-            for idx in over_limit_indices:
-                i = int(idx)
-                if i >= len(req_ids):
-                    continue
-                req_id = req_ids[i]
-                req_state = self.runner.requests.get(req_id)
-                if req_state is None:
-                    continue
-                req_state_tokens = int(req_state.num_tokens)
-                if req_state_tokens < int(num_tokens_no_spec[i]):
-                    num_tokens_no_spec[i] = req_state_tokens
+            num_tokens_no_spec[over_limit_indices] = np.minimum(
+                num_tokens_no_spec[over_limit_indices],
+                num_tokens_snapshot[over_limit_indices],
+            )
 
         valid_mask = num_tokens_no_spec[candidate_indices] < self.max_model_len
         valid_ngram_requests = candidate_indices[valid_mask]
