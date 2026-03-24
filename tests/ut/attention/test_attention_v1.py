@@ -172,6 +172,33 @@ class TestAscendAttentionMetadataBuilder(TestBase):
 
         self.builder.build(1, common_attn_metadata, mock_model)
 
+    @patch('vllm_ascend.attention.attention_v1.is_310p', return_value=False)
+    def test_build_spec_decoding_uses_spec_attn_mask(self, mock_is_310p):
+        spec_attn_mask = torch.triu(torch.ones((8, 8), dtype=torch.bool),
+                                    diagonal=1)
+        common_attn_metadata = AscendCommonAttentionMetadata(
+            query_start_loc=torch.tensor([0, 2, 4]),
+            query_start_loc_cpu=torch.tensor([0, 2, 4]),
+            seq_lens_cpu=torch.tensor([8, 8]),
+            num_reqs=2,
+            num_actual_tokens=4,
+            max_query_len=2,
+            decode_token_per_req=torch.tensor([2, 2]),
+            block_table_tensor=torch.zeros((2, 4), dtype=torch.int32),
+            slot_mapping=torch.tensor(range(8)),
+            actual_seq_lengths_q=[2, 4],
+            positions=torch.tensor([0, 1, 2, 3]),
+            attn_mask=None,
+            spec_attn_mask=spec_attn_mask,
+            attn_state=AscendAttentionState.SpecDecoding,
+            num_computed_tokens_cpu=torch.tensor([6, 6]),
+            seq_lens=torch.tensor([8, 8]))
+
+        attn_metadata = self.builder.build(0, common_attn_metadata, None)
+        self.assertIs(attn_metadata.attn_mask, spec_attn_mask)
+        self.assertEqual(attn_metadata.attn_state,
+                         AscendAttentionState.SpecDecoding)
+
 
 class TestAscendAttentionBackendImpl(TestBase):
 

@@ -224,8 +224,13 @@ class AscendAttentionMetadataBuilder:
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[:
                                                                        num_reqs
                                                                        + 1]
+        if attn_state == AscendAttentionState.SpecDecoding:
+            # SpecDecoding uses a dedicated triangular mask. For v1 backend,
+            # route it through `attn_mask` so `_forward_v1_style` can consume it.
+            attn_mask = common_attn_metadata.spec_attn_mask
 
-        if attn_state == AscendAttentionState.DecodeOnly and \
+        if attn_state in (AscendAttentionState.DecodeOnly,
+                          AscendAttentionState.SpecDecoding) and \
             common_attn_metadata.num_input_tokens > num_actual_tokens:
             padded_num_tokens = common_attn_metadata.num_input_tokens - num_actual_tokens
             seq_lens = torch.cat([
@@ -255,7 +260,8 @@ class AscendAttentionMetadataBuilder:
                 mask_nz = nd_to_nz_2d(attn_mask)
                 attn_mask = torch_npu.npu_format_cast(mask_nz.contiguous(),
                                                       ACL_FORMAT_FRACTAL_NZ)
-            elif attn_state == AscendAttentionState.ChunkedPrefill:
+            elif attn_state in (AscendAttentionState.ChunkedPrefill,
+                                AscendAttentionState.SpecDecoding):
                 mask_nz = nd_to_nz_spec(attn_mask)
                 attn_mask = torch_npu.npu_format_cast(mask_nz.contiguous(),
                                                       ACL_FORMAT_FRACTAL_NZ)
@@ -281,14 +287,18 @@ class AscendAttentionMetadataBuilder:
         attn_state: AscendAttentionState = AscendAttentionState.DecodeOnly,
         model: Optional[nn.Module] = None,
     ):
-        if attn_state == AscendAttentionState.DecodeOnly:
+        if attn_state in {
+                AscendAttentionState.DecodeOnly,
+                AscendAttentionState.SpecDecoding
+        }:
             attn_metadata = self.build(
                 common_prefix_len=0,
                 common_attn_metadata=common_attn_metadata,
             )
         else:
             raise NotImplementedError(
-                "Currently we only support building dummy metadata for DecodeOnly state"
+                "Currently we only support building dummy metadata for "
+                "DecodeOnly and SpecDecoding state"
             )
 
         attn_metadata.attn_state = attn_state
