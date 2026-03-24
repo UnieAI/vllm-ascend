@@ -155,7 +155,7 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 影響：在連續無匹配期間顯著降低 matcher 觸發頻率，釋放 CPU 給排程與資料搬運，間接提高 GPU 可用工作密度。
 狀態：本次提交納入，後續依實測調整 max steps 與 min_len。
 
-## `(this commit)` - Vectorize random rejection path and reintroduce gated ngram matcher threading
+## `aebeab0b` ~ `d73348d7` - Vectorize random rejection path and reintroduce gated ngram matcher threading
 背景：實測顯示 decode 階段 GPU util 在 request 穩定流入後仍偏低，且 ngram 模式在中高併發吞吐明顯落後，指向 host 端仍有可見熱點。
 修改：
 1. `vllm_ascend/sample/rejection_sampler.py`：
@@ -194,7 +194,7 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
   2. 保留低風險向量化與 zero-draft fast-path。
   3. 持續比對 upstream (`~/workspace/jeff/vllm-origin/vllm`) 的熱路徑語義與成本分佈。
 
-## `(this commit)` - Further reduce proposer/backoff and lazy-recover hot-path CPU cost
+## `f809af89` ~ `9f08c4ac` - Further reduce proposer/backoff and lazy-recover hot-path CPU cost
 背景：在 16-concurrency 下仍看到 GPU util 未打滿，推測 decode loop 還有 request 級 Python 迴圈與不必要大張量配置。
 修改：
 1. `vllm_ascend/spec_decode/ngram_proposer.py`
@@ -208,7 +208,7 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
    - 同步覆蓋 non-async 與 async+ngram proposer 兩條無 logprobs 路徑，降低每步 sampled token 解析成本。
 影響：降低 ngram proposer 每步 Python 迴圈成本，並壓縮 lazy-recover 在「少量 reject」場景的記憶體/算力開銷，目標是提升 steady-state decode throughput 與 GPU util。
 
-## `(this commit)` - Broader optimization batch: search-window policy, long-context backoff, and parse/lazy-recover overhead
+## `76649866` ~ `220775a3` - Broader optimization batch: search-window policy, long-context backoff, and parse/lazy-recover overhead
 背景：最新量測 `1/16 concurrency = 56 / 445`、`util ≈ 37%`，顯示 NPU 仍長時間等 CPU 熱路徑。
 修改：
 1. `vllm_ascend/spec_decode/ngram_proposer.py`
@@ -233,7 +233,7 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
    - 精簡 helper 參數與呼叫資料流，移除不再使用的 `num_draft_tokens` 傳遞。
 影響：目標是降低 proposer/rejection 兩個 CPU 熱點的固定成本，提高 steady-state util 與 16-concurrency 吞吐。
 
-## `(this commit)` - 回退高併發硬降級，改為 batch 品質閥值 + token-level rejection 快路徑
+## `b6688cb6` - 回退高併發硬降級，改為 batch 品質閥值 + token-level rejection 快路徑
 背景：目前觀察到 ngram 在 `1 concurrency` 已經沒有優勢，`16 concurrency`（低併發）反而顯著變慢。原先「按併發門檻直接降級/關閉 ngram」不符合預期，因此改為回退並重寫熱路徑。
 
 修改：
@@ -270,7 +270,7 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 - 降低 rejection sampler 每步固定成本，目標是改善 decode 階段 NPU util 與 16-concurrency 吞吐。
 - 提供可控的 batch gate（預設關閉），後續可在目標機用環境變數做 A/B 微調。
 
-## `(this commit)` - 修正 ngram attn-state 路徑並降低 speculative 浮點/CPU 固定開銷
+## `5977625f` - 修正 ngram attn-state 路徑並降低 speculative 浮點/CPU 固定開銷
 背景：最新測試仍為 `56, 447`（1/16 concurrency），推測問題不只 proposer，而是 ngram decode 仍落在較重執行路徑。
 
 修改：
@@ -298,3 +298,17 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 影響：
 - 先修正路徑級問題（SpecDecoding vs ChunkedPrefill），再壓低 ngram speculative 的固定成本（float64/CPU contention）。
 - 預期改善 16-concurrency 下 decode 階段的 NPU util 與 throughput 下限，並避免「少量 draft 拖垮整批」。
+
+## 2026-03-24 - 調整 proposer 預設策略以降低低併發 CPU 熱點
+背景：在固定外部參數設定下，16-concurrency 吞吐仍偏向 CPU 受限，顯示 proposer 預設掃描/執行緒策略仍可再收斂。
+
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - `VLLM_ASCEND_NGRAM_DEFAULT_SEARCH_WINDOW` 的程式預設值由 `0`（全上下文）調整為 `1024`，降低 matcher 在長序列下每步掃描成本。
+   - 修正 numba 執行緒預設推導上限，將 `min(1, ...)` 調整為 `min(4, ...)`，避免預設值被固定在單執行緒。
+   - 將 `VLLM_ASCEND_NGRAM_NUMBA_TOKENS_THRESHOLD` 的程式預設改為動態：
+     - 預設可多執行緒時使用 `4096`
+     - 否則維持 `16384`
+
+影響：
+- 在不改外部 env 參數的前提下，降低 proposer 的 CPU 固定成本，提升中低併發下 ngram 路徑的實用吞吐。

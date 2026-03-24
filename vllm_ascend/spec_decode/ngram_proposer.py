@@ -42,7 +42,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
         self.default_search_window = max(
             0,
             int(os.environ.get("VLLM_ASCEND_NGRAM_DEFAULT_SEARCH_WINDOW",
-                               "0")),
+                               "1024")),
         )
         self.k = vllm_config.speculative_config.num_speculative_tokens
         self.max_model_len = vllm_config.model_config.max_model_len
@@ -57,10 +57,11 @@ class NgramProposer(VllmNgramProposer, Proposer):
         cpu_count = os.cpu_count()
         if cpu_count:
             default_numba_threads = min(
-                1, max(1,
+                4, max(1,
                        (cpu_count // 2) // max(1, tp_size)))
         else:
             default_numba_threads = 1
+        default_tokens_threshold = 4096 if default_numba_threads > 1 else 16384
         self.num_numba_thread_available = max(
             1,
             int(
@@ -71,7 +72,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
             1,
             int(
                 os.environ.get("VLLM_ASCEND_NGRAM_NUMBA_TOKENS_THRESHOLD",
-                               "16384")),
+                               str(default_tokens_threshold))),
         )
         # Keep one thread for small batches and only switch when needed.
         self._current_numba_threads = 1
