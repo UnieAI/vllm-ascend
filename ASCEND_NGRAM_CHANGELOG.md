@@ -339,3 +339,16 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 在有 seeded generator 的 ngram rejection 情境下，降低 host 端 Python 管理成本，改善 16-concurrency 下的尾延遲與吞吐穩定度。
+
+## 2026-03-24 - 減少 ngram proposer 每步 numpy 臨時配置開銷
+背景：`batch_propose` 每步都會建立 `active_mask/run_mask` 等臨時陣列，16-concurrency 下容易形成固定 CPU 負擔。
+
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - 新增 `_req_active_mask` 持久化 request 活躍狀態，替代每步 `np.zeros(num_requests)` 的 activity mask 建立。
+   - 將 inactive request reset 邏輯改為「僅處理上一步活躍、這一步不活躍」子集，減少全量補集掃描。
+   - 簡化 `run_requests` 計算路徑，移除 `run_mask = np.ones(...)` 的預設配置與不必要中間陣列。
+   - `_ensure_request_backoff_state` 擴容時同步擴容 `_req_active_mask`。
+
+影響：
+- 降低 proposer 在 decode 熱路徑中的每步固定 numpy 配置成本，提升中低併發下 ngram matcher 的 CPU 效率。

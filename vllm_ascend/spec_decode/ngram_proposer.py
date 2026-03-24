@@ -113,6 +113,9 @@ class NgramProposer(VllmNgramProposer, Proposer):
         )
         self._req_skip_match_steps = np.zeros(max_num_seqs, dtype=np.int32)
         self._req_no_match_streak = np.zeros(max_num_seqs, dtype=np.int32)
+        # Tracks requests that were active in the previous step to avoid
+        # rebuilding per-step activity masks in batch_propose.
+        self._req_active_mask = np.zeros(max_num_seqs, dtype=np.bool_)
 
         warmup_num_reqs = min(8, max_num_seqs)
         warmup_model_len = min(
@@ -244,10 +247,13 @@ class NgramProposer(VllmNgramProposer, Proposer):
         new_size = max(num_requests, current_size * 2)
         new_skip = np.zeros(new_size, dtype=np.int32)
         new_streak = np.zeros(new_size, dtype=np.int32)
+        new_active = np.zeros(new_size, dtype=np.bool_)
         new_skip[:current_size] = self._req_skip_match_steps
         new_streak[:current_size] = self._req_no_match_streak
+        new_active[:current_size] = self._req_active_mask
         self._req_skip_match_steps = new_skip
         self._req_no_match_streak = new_streak
+        self._req_active_mask = new_active
 
     def batch_propose(self, num_requests: int,
                       valid_ngram_requests: np.ndarray,
@@ -257,21 +263,31 @@ class NgramProposer(VllmNgramProposer, Proposer):
         num_ngram_requests = len(valid_ngram_requests)
         if num_ngram_requests == 0:
             if num_requests > 0:
+                if self.no_match_backoff_enabled:
+                    active_mask = self._req_active_mask[:num_requests]
+                    inactive_indices = np.nonzero(active_mask)[0]
+                    if inactive_indices.size > 0:
+                        self._req_skip_match_steps[inactive_indices] = 0
+                        self._req_no_match_streak[inactive_indices] = 0
+                    active_mask[:] = False
                 self._req_skip_match_steps[:num_requests] = 0
                 self._req_no_match_streak[:num_requests] = 0
             return [[] for _ in range(num_requests)]
 
         if self.no_match_backoff_enabled and num_requests > 0:
-            active_mask = np.zeros(num_requests, dtype=np.bool_)
+            active_mask = self._req_active_mask[:num_requests]
+            prev_active_indices = np.nonzero(active_mask)[0]
+            active_mask[:] = False
             active_mask[valid_ngram_requests] = True
-            inactive_indices = np.nonzero(~active_mask)[0]
-            if inactive_indices.size > 0:
-                self._req_skip_match_steps[inactive_indices] = 0
-                self._req_no_match_streak[inactive_indices] = 0
+            if prev_active_indices.size > 0:
+                inactive_prev = prev_active_indices[
+                    ~active_mask[prev_active_indices]]
+                if inactive_prev.size > 0:
+                    self._req_skip_match_steps[inactive_prev] = 0
+                    self._req_no_match_streak[inactive_prev] = 0
 
         self.valid_ngram_num_drafts[valid_ngram_requests] = 0
-        run_mask = np.ones(num_ngram_requests, dtype=np.bool_)
-        short_mask = np.zeros(num_ngram_requests, dtype=np.bool_)
+        run_requests = valid_ngram_requests
         if self.no_match_backoff_enabled:
             req_indices = valid_ngram_requests
             token_counts = num_tokens_no_spec[req_indices]
@@ -286,9 +302,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
             if skip_now_mask.any():
                 skip_reqs = req_indices[skip_now_mask]
                 self._req_skip_match_steps[skip_reqs] -= 1
-            run_mask = (~short_mask) & (~skip_now_mask)
-
-        run_requests = valid_ngram_requests[run_mask]
+            run_requests = req_indices[(~short_mask) & (~skip_now_mask)]
         if run_requests.size > 0:
             default_window = self.search_window if self.search_window is not None \
                 else self.default_search_window
