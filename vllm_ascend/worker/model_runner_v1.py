@@ -386,6 +386,44 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 os.environ.get("VLLM_ASCEND_NGRAM_BATCH_GATE_MIN_AVG_DRAFTS",
                                "0.5")),
         )
+        # Adaptive ngram cooldown gate:
+        # If recent speculative gain remains low, skip proposer for a few
+        # steps to avoid paying proposer/rejection overhead continuously.
+        self.ngram_adaptive_gate_enabled = bool(
+            int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_GATE", "1")))
+        self.ngram_adaptive_gain_threshold = max(
+            0.0,
+            float(
+                os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_GAIN_THRESHOLD",
+                               "0.08")),
+        )
+        self.ngram_adaptive_gain_decay = min(
+            0.99,
+            max(
+                0.0,
+                float(
+                    os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_GAIN_DECAY",
+                                   "0.85")),
+            ),
+        )
+        self.ngram_adaptive_patience_steps = max(
+            1,
+            int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_PATIENCE",
+                               "3")),
+        )
+        self.ngram_adaptive_cooldown_steps = max(
+            1,
+            int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_COOLDOWN",
+                               "4")),
+        )
+        self.ngram_adaptive_warmup_steps = max(
+            0,
+            int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_WARMUP", "8")),
+        )
+        self._ngram_adaptive_step = 0
+        self._ngram_adaptive_gain_ema = 0.0
+        self._ngram_adaptive_low_gain_streak = 0
+        self._ngram_adaptive_cooldown_remaining = 0
         self.actual_seq_lengths_q: list[int] = []
         self.decode_token_per_req = 1
         if self.speculative_config:
@@ -1873,6 +1911,38 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # Speculative decoding is not enabled.
             draft_token_ids = None
         else:
+            if (self.drafter.name == SpecDcodeType.NGRAM
+                    and self.ngram_adaptive_gate_enabled
+                    and isinstance(valid_sampled_token_ids, list)):
+                self._ngram_adaptive_step += 1
+                num_reqs = len(valid_sampled_token_ids)
+                if num_reqs > 0:
+                    extra_tokens = 0
+                    for row in valid_sampled_token_ids:
+                        row_len = len(row)
+                        if row_len > 1:
+                            extra_tokens += (row_len - 1)
+                    step_gain = extra_tokens / num_reqs
+                    decay = self.ngram_adaptive_gain_decay
+                    self._ngram_adaptive_gain_ema = (
+                        decay * self._ngram_adaptive_gain_ema
+                        + (1.0 - decay) * step_gain
+                    )
+                if (self._ngram_adaptive_step > self.ngram_adaptive_warmup_steps
+                        and self._ngram_adaptive_cooldown_remaining > 0):
+                    self._ngram_adaptive_cooldown_remaining -= 1
+                    return [[] for _ in range(len(valid_sampled_token_ids))]
+                if self._ngram_adaptive_step > self.ngram_adaptive_warmup_steps:
+                    if self._ngram_adaptive_gain_ema < self.ngram_adaptive_gain_threshold:
+                        self._ngram_adaptive_low_gain_streak += 1
+                    else:
+                        self._ngram_adaptive_low_gain_streak = 0
+                    if self._ngram_adaptive_low_gain_streak >= \
+                            self.ngram_adaptive_patience_steps:
+                        self._ngram_adaptive_low_gain_streak = 0
+                        self._ngram_adaptive_cooldown_remaining = \
+                            self.ngram_adaptive_cooldown_steps
+                        return [[] for _ in range(len(valid_sampled_token_ids))]
             draft_token_ids = self.drafter.generate_token_ids(
                 valid_sampled_token_ids, sampling_metadata, scheduler_output,
                 spec_decode_metadata, positions, num_scheduled_tokens,

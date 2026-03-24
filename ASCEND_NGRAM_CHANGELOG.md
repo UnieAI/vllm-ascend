@@ -396,3 +396,21 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 這是偏吞吐導向的演算法級優化，目標是顯著降低 reject-row recovered sampling 的固定成本，改善 16-concurrency throughput。
+
+## 2026-03-24 - 新增 ngram 自適應 cooldown gate（較大策略改動）
+背景：當 speculative 實際增益持續偏低時，持續執行 proposer/rejection 只會增加 CPU 成本，吞吐可能低於 decode-only 基線。
+
+修改：
+1. `vllm_ascend/worker/model_runner_v1.py`
+   - 新增 adaptive gate（預設開啟）：
+     - `VLLM_ASCEND_NGRAM_ADAPTIVE_GATE`（預設 `1`）
+     - `VLLM_ASCEND_NGRAM_ADAPTIVE_GAIN_THRESHOLD`（預設 `0.08`）
+     - `VLLM_ASCEND_NGRAM_ADAPTIVE_GAIN_DECAY`（預設 `0.85`）
+     - `VLLM_ASCEND_NGRAM_ADAPTIVE_PATIENCE`（預設 `3`）
+     - `VLLM_ASCEND_NGRAM_ADAPTIVE_COOLDOWN`（預設 `4`）
+     - `VLLM_ASCEND_NGRAM_ADAPTIVE_WARMUP`（預設 `8`）
+   - 在 `propose_draft_token_ids` 中以當步 `valid_sampled_token_ids` 的平均 extra tokens 更新 gain EMA。
+   - 若 warmup 後 gain EMA 連續低於門檻達到 patience，則進入 cooldown，直接回傳空 drafts 若干步，讓路徑回到 decode-only，減少固定 CPU 開銷。
+
+影響：
+- 在低收益 ngram 區間動態降載 proposer/rejection，目標是把 16-concurrency 吞吐從「長時間 CPU 受限」拉回更接近甚至超過 decode-only 基線。
