@@ -352,3 +352,18 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 降低 proposer 在 decode 熱路徑中的每步固定 numpy 配置成本，提升中低併發下 ngram matcher 的 CPU 效率。
+
+## 2026-03-24 - 修復 ngram proposer 初始化時序導致的 AttributeError
+背景：upstream `VllmNgramProposer.__init__` 會在基類初始化期間呼叫 `self.propose()`。在 Ascend 子類尚未完成成員初始化時，可能觸發 `no_match_backoff_enabled` 等屬性缺失。
+
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - 在 `super().__init__` 之前預先設置 warmup 需要的安全預設：
+     - `no_match_backoff_enabled`
+     - `_req_skip_match_steps`
+     - `_req_no_match_streak`
+     - `_req_active_mask`
+   - 保證基類 warmup 提前呼叫 `propose()` 時不會因屬性未建立而 crash。
+
+影響：
+- 修復服務啟動階段 `AttributeError: 'NgramProposer' object has no attribute 'no_match_backoff_enabled'`，恢復 ngram proposer 可用性。

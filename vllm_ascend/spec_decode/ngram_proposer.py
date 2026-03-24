@@ -27,6 +27,12 @@ class NgramProposer(VllmNgramProposer, Proposer):
         self.name = SpecDcodeType.NGRAM
         self.device = device
         self.runner = runner
+        # Upstream base __init__ may call self.propose() before subclass
+        # members are initialized. Seed safe defaults for that warmup path.
+        self.no_match_backoff_enabled = False
+        self._req_skip_match_steps = np.zeros(0, dtype=np.int32)
+        self._req_no_match_streak = np.zeros(0, dtype=np.int32)
+        self._req_active_mask = np.zeros(0, dtype=np.bool_)
         super().__init__(vllm_config)
         assert vllm_config.speculative_config is not None
         assert vllm_config.speculative_config.prompt_lookup_min is not None
