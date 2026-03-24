@@ -63,11 +63,11 @@ class NgramProposer(VllmNgramProposer, Proposer):
         cpu_count = os.cpu_count()
         if cpu_count:
             default_numba_threads = min(
-                4, max(1,
+                8, max(1,
                        (cpu_count // 2) // max(1, tp_size)))
         else:
             default_numba_threads = 1
-        default_tokens_threshold = 4096 if default_numba_threads > 1 else 16384
+        default_tokens_threshold = 2048 if default_numba_threads > 1 else 16384
         self.num_numba_thread_available = max(
             1,
             int(
@@ -227,6 +227,41 @@ class NgramProposer(VllmNgramProposer, Proposer):
             self.valid_ngram_num_drafts,
         )
 
+    def run_batch_match_with_windows(
+            self,
+            valid_ngram_requests: np.ndarray,
+            num_tokens_no_spec: np.ndarray,
+            token_ids_cpu: np.ndarray,
+            search_windows: np.ndarray,
+            draft_k: int | None = None) -> None:
+        num_ngram_requests = len(valid_ngram_requests)
+        if not num_ngram_requests:
+            return
+        if not hasattr(self, "_current_numba_threads"):
+            self._current_numba_threads = 1
+            set_num_threads(self._current_numba_threads)
+        desired_threads = 1
+        total_tokens = int(np.sum(num_tokens_no_spec[valid_ngram_requests]))
+        if total_tokens >= self.num_tokens_threshold:
+            desired_threads = min(self.num_numba_thread_available,
+                                  num_ngram_requests)
+        if desired_threads != self._current_numba_threads:
+            set_num_threads(desired_threads)
+            self._current_numba_threads = desired_threads
+
+        batch_propose_numba_with_windows(
+            valid_ngram_requests,
+            num_tokens_no_spec,
+            token_ids_cpu,
+            self.min_n,
+            self.max_n,
+            search_windows,
+            self.max_model_len,
+            (self.k if draft_k is None else draft_k),
+            self.valid_ngram_draft,
+            self.valid_ngram_num_drafts,
+        )
+
     def materialize_draft_token_ids(
             self, num_requests: int,
             valid_ngram_requests: np.ndarray) -> list[list[int]]:
@@ -321,22 +356,35 @@ class NgramProposer(VllmNgramProposer, Proposer):
                 streaks = self._req_no_match_streak[run_requests]
                 backoff_window_mask = \
                     streaks >= self.no_match_backoff_window_streak
-                run_requests_default = run_requests[~backoff_window_mask]
-                run_requests_backoff = run_requests[backoff_window_mask]
-                if run_requests_default.size > 0:
-                    self.run_batch_match(
-                        run_requests_default,
+                if backoff_window_mask.any() and (~backoff_window_mask).any():
+                    req_windows = np.full(
+                        run_requests.shape[0],
+                        default_window,
+                        dtype=np.int32,
+                    )
+                    req_windows[backoff_window_mask] = \
+                        self.no_match_backoff_window
+                    self.run_batch_match_with_windows(
+                        run_requests,
                         num_tokens_no_spec,
                         token_ids_cpu,
-                        search_window=default_window,
+                        req_windows,
                         draft_k=self.k,
                     )
-                if run_requests_backoff.size > 0:
+                elif backoff_window_mask.any():
                     self.run_batch_match(
-                        run_requests_backoff,
+                        run_requests,
                         num_tokens_no_spec,
                         token_ids_cpu,
                         search_window=self.no_match_backoff_window,
+                        draft_k=self.k,
+                    )
+                else:
+                    self.run_batch_match(
+                        run_requests,
+                        num_tokens_no_spec,
+                        token_ids_cpu,
+                        search_window=default_window,
                         draft_k=self.k,
                     )
             else:
@@ -475,6 +523,40 @@ def batch_propose_numba(
     for i in prange(len(valid_ngram_requests)):
         idx = valid_ngram_requests[i]
         num_tokens = num_tokens_no_spec[idx]
+        search_start = 0
+        if search_window > 0 and num_tokens > search_window:
+            search_start = num_tokens - search_window
+        context_token_ids = token_ids_cpu[idx, search_start:num_tokens]
+        start_position, draft_len = _find_longest_matched_ngram_and_propose_tokens(
+            origin_tokens=context_token_ids,
+            min_ngram=min_n,
+            max_ngram=max_n,
+            max_model_len=max_model_len,
+            k=k,
+        )
+        valid_ngram_num_drafts[idx] = draft_len
+        if draft_len > 0:
+            valid_ngram_draft[idx, :draft_len] = context_token_ids[
+                start_position:start_position + draft_len]
+
+
+@njit(parallel=True)
+def batch_propose_numba_with_windows(
+    valid_ngram_requests: np.ndarray,
+    num_tokens_no_spec: np.ndarray,
+    token_ids_cpu: np.ndarray,
+    min_n: int,
+    max_n: int,
+    search_windows: np.ndarray,
+    max_model_len: int,
+    k: int,
+    valid_ngram_draft: np.ndarray,
+    valid_ngram_num_drafts: np.ndarray,
+):
+    for i in prange(len(valid_ngram_requests)):
+        idx = valid_ngram_requests[i]
+        num_tokens = num_tokens_no_spec[idx]
+        search_window = search_windows[i]
         search_start = 0
         if search_window > 0 and num_tokens > search_window:
             search_start = num_tokens - search_window
