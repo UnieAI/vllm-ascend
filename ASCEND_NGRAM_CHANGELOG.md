@@ -483,3 +483,19 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 不改 ngram 匹配演算法，僅降低 proposer Python 熱路徑開銷，為後續 async 輕量傳遞鋪路。
+
+## 2026-03-24 - async ngram proposer 改走 sampled-lens 輕量傳遞
+背景：async + ngram 路徑即使已在 model runner 取得 `valid_sampled_token_ids`，proposer 端仍需再掃描 list 計算候選與長度，造成重複 CPU 開銷。
+
+修改：
+1. `vllm_ascend/worker/model_runner_v1.py`
+   - 新增 `_fast_filter_sampled_token_ids_with_lens(...)`，在過濾 sampled token 時同步產生每個 request 的 `sampled_token_lens`。
+   - 新增 `_compute_sampled_token_lens(...)`，針對 `max_gen_len == 1` 的情況用 tensor mask 直接計算長度。
+   - 在 `execute_model` 產生 `sampled_token_lens_np` 與 `ngram_candidate_indices`，並傳給 `propose_draft_token_ids(...)`。
+   - adaptive gain 計算優先使用 `sampled_token_lens`（向量化），避免再掃 list。
+   - ngram proposer 呼叫時帶入：
+     - `sampled_token_lens`
+     - `candidate_indices`
+
+影響：
+- 減少 async ngram 路徑重複的 list 掃描與候選重算，目標降低 CPU proposer 開銷並提升 NPU 持續餵料能力。

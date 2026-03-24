@@ -1919,6 +1919,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         hidden_states: torch.Tensor,
         attn_metadata: dict[str, Any],
         aux_hidden_states: torch.Tensor = None,
+        sampled_token_lens: Optional[np.ndarray] = None,
+        ngram_candidate_indices: Optional[np.ndarray] = None,
     ) -> Optional[list[list[int]]]:
         if not self.drafter:
             # Speculative decoding is not enabled.
@@ -1930,11 +1932,17 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 self._ngram_adaptive_step += 1
                 num_reqs = len(valid_sampled_token_ids)
                 if num_reqs > 0:
-                    extra_tokens = 0
-                    for row in valid_sampled_token_ids:
-                        row_len = len(row)
-                        if row_len > 1:
-                            extra_tokens += (row_len - 1)
+                    if sampled_token_lens is not None and \
+                            sampled_token_lens.shape[0] >= num_reqs:
+                        clipped_lens = np.maximum(
+                            sampled_token_lens[:num_reqs] - 1, 0)
+                        extra_tokens = int(np.sum(clipped_lens))
+                    else:
+                        extra_tokens = 0
+                        for row in valid_sampled_token_ids:
+                            row_len = len(row)
+                            if row_len > 1:
+                                extra_tokens += (row_len - 1)
                     step_gain = extra_tokens / num_reqs
                     decay = self.ngram_adaptive_gain_decay
                     self._ngram_adaptive_gain_ema = (
@@ -1956,10 +1964,32 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         self._ngram_adaptive_cooldown_remaining = \
                             self.ngram_adaptive_cooldown_steps
                         return [[] for _ in range(len(valid_sampled_token_ids))]
-            draft_token_ids = self.drafter.generate_token_ids(
-                valid_sampled_token_ids, sampling_metadata, scheduler_output,
-                spec_decode_metadata, positions, num_scheduled_tokens,
-                hidden_states, attn_metadata, aux_hidden_states)
+            if self.drafter.name == SpecDcodeType.NGRAM:
+                draft_token_ids = self.drafter.generate_token_ids(
+                    valid_sampled_token_ids,
+                    sampling_metadata,
+                    scheduler_output,
+                    spec_decode_metadata,
+                    positions,
+                    num_scheduled_tokens,
+                    hidden_states,
+                    attn_metadata,
+                    aux_hidden_states,
+                    sampled_token_lens=sampled_token_lens,
+                    candidate_indices=ngram_candidate_indices,
+                )
+            else:
+                draft_token_ids = self.drafter.generate_token_ids(
+                    valid_sampled_token_ids,
+                    sampling_metadata,
+                    scheduler_output,
+                    spec_decode_metadata,
+                    positions,
+                    num_scheduled_tokens,
+                    hidden_states,
+                    attn_metadata,
+                    aux_hidden_states,
+                )
             if (self.drafter.name == SpecDcodeType.NGRAM
                     and isinstance(draft_token_ids, list)):
                 if (self.ngram_adaptive_gate_enabled
@@ -2170,10 +2200,21 @@ class NPUModelRunner(LoRAModelRunnerMixin):
     def _fast_filter_sampled_token_ids(
             self, sampled_token_ids: torch.Tensor,
             vocab_size: int) -> list[list[int]]:
+        valid_sampled_token_ids, _ = \
+            self._fast_filter_sampled_token_ids_with_lens(
+                sampled_token_ids, vocab_size)
+        return valid_sampled_token_ids
+
+    def _fast_filter_sampled_token_ids_with_lens(
+        self,
+        sampled_token_ids: torch.Tensor,
+        vocab_size: int,
+    ) -> tuple[list[list[int]], np.ndarray]:
         sampled_token_ids_cpu = self._copy_sampled_token_ids_to_cpu(
             sampled_token_ids)
         if sampled_token_ids_cpu.numel() == 0:
-            return [[] for _ in range(sampled_token_ids_cpu.shape[0])]
+            return ([[] for _ in range(sampled_token_ids_cpu.shape[0])],
+                    np.zeros(sampled_token_ids_cpu.shape[0], dtype=np.int32))
 
         valid_mask = ((sampled_token_ids_cpu != -1)
                       & (sampled_token_ids_cpu < vocab_size))
@@ -2182,18 +2223,35 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         is_prefix_mask = not torch.any((~valid_mask[:, :-1])
                                        & valid_mask[:, 1:]).item()
         if is_prefix_mask:
-            valid_counts = valid_mask.sum(dim=1, dtype=torch.int64).tolist()
+            valid_counts_np = valid_mask.sum(
+                dim=1, dtype=torch.int64).numpy().astype(
+                    np.int32, copy=False)
             sampled_token_ids_np = sampled_token_ids_cpu.numpy()
-            return [
-                sampled_token_ids_np[i, :valid_counts[i]].tolist()
-                for i in range(sampled_token_ids_np.shape[0])
+            valid_sampled_token_ids = [
+                sampled_token_ids_np[i, :count].tolist()
+                for i, count in enumerate(valid_counts_np.tolist())
             ]
+            return valid_sampled_token_ids, valid_counts_np.copy()
 
         valid_sampled_token_ids: list[list[int]] = []
+        sampled_lens = np.zeros(sampled_token_ids_cpu.shape[0], dtype=np.int32)
         for i in range(sampled_token_ids_cpu.shape[0]):
             row = sampled_token_ids_cpu[i][valid_mask[i]]
-            valid_sampled_token_ids.append(row.tolist())
-        return valid_sampled_token_ids
+            row_list = row.tolist()
+            valid_sampled_token_ids.append(row_list)
+            sampled_lens[i] = len(row_list)
+        return valid_sampled_token_ids, sampled_lens
+
+    def _compute_sampled_token_lens(
+            self, sampled_token_ids: torch.Tensor,
+            vocab_size: int) -> np.ndarray:
+        if sampled_token_ids.dim() != 2:
+            return np.zeros((sampled_token_ids.shape[0], ), dtype=np.int32)
+        valid_mask = ((sampled_token_ids != -1)
+                      & (sampled_token_ids < vocab_size))
+        return valid_mask.sum(dim=1,
+                              dtype=torch.int32).to("cpu").numpy().astype(
+                                  np.int32, copy=False)
 
     @torch.inference_mode()
     def execute_model(
@@ -2400,6 +2458,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
             num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
             sampled_token_ids = sampler_output.sampled_token_ids
+            sampled_token_lens_np: Optional[np.ndarray] = None
+            ngram_candidate_indices: Optional[np.ndarray] = None
             require_valid_sampled_token_ids_for_proposer = (
                 self.use_async_scheduling and self.speculative_config is not None
                 and self.drafter is not None
@@ -2410,17 +2470,17 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 if max_gen_len == 1:
                     # No spec decode tokens.
                     valid_sampled_token_ids = self._to_list(sampled_token_ids)
+                    sampled_token_lens_np = self._compute_sampled_token_lens(
+                        sampled_token_ids, self.input_batch.vocab_size)
                     if logprobs_tensors is not None:
                         # NOTE: NPU -> CPU Sync happens here.
                         logprobs_lists = logprobs_tensors.tolists()
                 else:
                     # Includes spec decode tokens.
                     if logprobs_tensors is None:
-                        valid_sampled_token_ids = \
-                            self._fast_filter_sampled_token_ids(
-                                sampled_token_ids,
-                                self.input_batch.vocab_size,
-                            )
+                        valid_sampled_token_ids, sampled_token_lens_np = \
+                            self._fast_filter_sampled_token_ids_with_lens(
+                                sampled_token_ids, self.input_batch.vocab_size)
                         logprobs_lists = None
                     else:
                         valid_sampled_token_ids, logprobs_lists = \
@@ -2429,9 +2489,19 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                 self.input_batch.vocab_size,
                                 logprobs_tensors,
                             )
+                        sampled_token_lens_np = np.fromiter(
+                            (len(row) for row in valid_sampled_token_ids),
+                            dtype=np.int32,
+                            count=len(valid_sampled_token_ids),
+                        )
                 # Mask out the sampled tokens that should not be sampled.
                 for i in discard_sampled_tokens_req_indices:
                     valid_sampled_token_ids[i].clear()
+                if sampled_token_lens_np is not None \
+                        and len(discard_sampled_tokens_req_indices) > 0:
+                    sampled_token_lens_np[
+                        np.asarray(discard_sampled_tokens_req_indices,
+                                   dtype=np.int32)] = 0
             else:
                 invalid_req_indices = list(discard_sampled_tokens_req_indices)
                 invalid_req_indices_set = set(invalid_req_indices)
@@ -2440,14 +2510,22 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     if max_gen_len == 1:
                         valid_sampled_token_ids = self._to_list(
                             sampled_token_ids)
-                    else:
-                        valid_sampled_token_ids = \
-                            self._fast_filter_sampled_token_ids(
+                        sampled_token_lens_np = \
+                            self._compute_sampled_token_lens(
                                 sampled_token_ids,
                                 self.input_batch.vocab_size,
                             )
+                    else:
+                        valid_sampled_token_ids, sampled_token_lens_np = \
+                            self._fast_filter_sampled_token_ids_with_lens(
+                                sampled_token_ids, self.input_batch.vocab_size)
                     for i in discard_sampled_tokens_req_indices:
                         valid_sampled_token_ids[i].clear()
+                    if sampled_token_lens_np is not None \
+                            and len(discard_sampled_tokens_req_indices) > 0:
+                        sampled_token_lens_np[
+                            np.asarray(discard_sampled_tokens_req_indices,
+                                       dtype=np.int32)] = 0
                 else:
                     valid_sampled_token_ids = []
                     assert sampled_token_ids.shape[-1] == 1
@@ -2477,6 +2555,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     for i, req_id in enumerate(self.input_batch.req_ids)
                     if i not in invalid_req_indices_set
                 }
+            if sampled_token_lens_np is not None:
+                ngram_candidate_indices = np.flatnonzero(
+                    sampled_token_lens_np > 0).astype(np.int32, copy=False)
             # Cache the sampled tokens in the model runner, so that the scheduler
             # doesn't need to send them back.
             # NOTE(woosuk): As an exception, when using PP, the scheduler sends
@@ -2586,6 +2667,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     hidden_states,
                     attn_metadata,
                     aux_hidden_states,
+                    sampled_token_lens=sampled_token_lens_np,
+                    ngram_candidate_indices=ngram_candidate_indices,
                 )
 
             if has_kv_transfer_group():
