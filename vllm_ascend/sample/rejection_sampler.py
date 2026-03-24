@@ -296,16 +296,31 @@ def rejection_sample_ngram_from_logits(
     logits_for_accept = target_logits
     if _NGRAM_ACCEPT_USE_FP32_LOGITS and target_logits.dtype != torch.float32:
         logits_for_accept = target_logits.to(torch.float32)
-    uniform_probs = uniform_probs.to(logits_for_accept.dtype)
-    draft_logits = logits_for_accept.gather(1,
-                                            draft_ids_long.unsqueeze(1)).squeeze(1)
-    log_denom = torch.logsumexp(logits_for_accept, dim=1)
-    log_uniform = torch.log(
-        uniform_probs.clamp_min(torch.finfo(logits_for_accept.dtype).tiny))
-    accept_mask = (draft_logits - log_denom) >= log_uniform
-    reject_mask = ~accept_mask
+    random_token_idx = torch.where(token_is_random)[0]
+    tiny = torch.finfo(logits_for_accept.dtype).tiny
+    if random_token_idx.numel() == num_tokens:
+        uniform_probs = uniform_probs.to(logits_for_accept.dtype)
+        draft_logits = logits_for_accept.gather(
+            1, draft_ids_long.unsqueeze(1)).squeeze(1)
+        log_denom = torch.logsumexp(logits_for_accept, dim=1)
+        log_uniform = torch.log(uniform_probs.clamp_min(tiny))
+        token_reject_mask = ~((draft_logits - log_denom) >= log_uniform)
+    else:
+        random_logits = logits_for_accept.index_select(0, random_token_idx)
+        random_draft_ids = draft_ids_long.index_select(0, random_token_idx)
+        random_uniform_probs = uniform_probs.index_select(
+            0, random_token_idx).to(logits_for_accept.dtype)
+        random_draft_logits = random_logits.gather(
+            1, random_draft_ids.unsqueeze(1)).squeeze(1)
+        random_log_denom = torch.logsumexp(random_logits, dim=1)
+        random_log_uniform = torch.log(random_uniform_probs.clamp_min(tiny))
+        random_reject_mask = ~((random_draft_logits - random_log_denom)
+                               >= random_log_uniform)
+        token_reject_mask = torch.zeros(num_tokens,
+                                        dtype=torch.bool,
+                                        device=device)
+        token_reject_mask[random_token_idx] = random_reject_mask
 
-    token_reject_mask = token_is_random & reject_mask
     reject_req_ids = token_req_ids[token_reject_mask]
     reject_positions = token_positions[token_reject_mask]
     first_reject_pos = _compute_first_reject_pos(

@@ -499,3 +499,16 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 減少 async ngram 路徑重複的 list 掃描與候選重算，目標降低 CPU proposer 開銷並提升 NPU 持續餵料能力。
+
+## 2026-03-24 - ngram logits rejection 只計算 random token rows
+背景：`rejection_sample_ngram_from_logits` 的接受判定會對所有 token rows 執行 `gather/logsumexp/log`，混合 greedy/random 批次下存在可避免的 NPU 固定成本。
+
+修改：
+1. `vllm_ascend/sample/rejection_sampler.py`
+   - 先基於 `token_is_random` 建立 `random_token_idx`。
+   - 若全部 token 都是 random，走原本全量向量化路徑。
+   - 若為混合批次，只對 random rows 執行接受判定算子，再將結果散回 `token_reject_mask`。
+   - 保持既有接受/拒絕語義不變。
+
+影響：
+- 降低混合批次的 NPU 不必要計算，目標提升 rejection 階段效率並減少 decode 固定延遲。
