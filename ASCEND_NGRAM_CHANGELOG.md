@@ -469,17 +469,3 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 保持既有 discard 語義不變，降低 post-process 每步 CPU 開銷，目標修正 `56/683` 類型回退並恢復 16-concurrency 吞吐。
-
-## 2026-03-24 - ngram proposer 加強平行化：混合 window 單次啟動 + 提高預設 numba threads
-背景：CPU ngram proposer 仍可能成為瓶頸，導致 NPU 平均利用率停在約 78%。現有 window backoff 路徑在混合 batch 時會分成兩次 numba 啟動，增加固定開銷。
-
-修改：
-1. `vllm_ascend/spec_decode/ngram_proposer.py`
-   - 將 numba 預設 thread 上限由 `4` 提高到 `8`（仍可透過 `VLLM_ASCEND_NGRAM_NUMBA_THREADS` 覆蓋）。
-   - 將多執行緒切換門檻預設由 `4096` 下調到 `2048` tokens（仍可透過 `VLLM_ASCEND_NGRAM_NUMBA_TOKENS_THRESHOLD` 覆蓋）。
-   - 新增 `run_batch_match_with_windows(...)` 與 `batch_propose_numba_with_windows(...)`：
-     - 對同一批 `run_requests` 支援 per-request search window。
-     - 當 batch 同時包含 default-window 與 backoff-window request 時，改為單次 numba 啟動處理，避免兩次啟動與兩次 thread 決策開銷。
-
-影響：
-- 強化 CPU 端 proposer 平行度與批次效率，目標降低 ngram 匹配等待時間，讓 NPU 有更高機率被持續餵滿。
