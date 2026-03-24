@@ -429,3 +429,15 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 以較平滑策略降低低收益區間的 verify/rejection 負擔，目標在不完全停用 ngram 的情況下進一步提升 16-concurrency 吞吐。
+
+## 2026-03-24 - ngram 接受判定預設切回低精度以降低 NPU 算子成本
+背景：`rejection_sample_ngram_from_logits` 的接受判定包含 `logsumexp`，在 FP32 路徑上算力成本較高，容易拖慢 decode 階段吞吐。
+
+修改：
+1. `vllm_ascend/sample/rejection_sampler.py`
+   - `VLLM_ASCEND_NGRAM_ACCEPT_USE_FP32_LOGITS` 預設由 `1` 調整為 `0`（仍可透過 env 開回 FP32）。
+   - 將 `uniform_probs` 對齊到 `logits_for_accept.dtype`，避免不必要的中間精度升降。
+   - `log_uniform` 的 `clamp_min` 使用接受判定 dtype 的 `tiny`，保持數值穩定。
+
+影響：
+- 純 NPU 算子路徑優化，目標是降低 ngram 接受判定的固定計算成本，提升 16-concurrency 吞吐與利用率。
