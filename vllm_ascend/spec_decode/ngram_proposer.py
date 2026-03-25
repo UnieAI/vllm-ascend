@@ -218,39 +218,20 @@ class NgramProposer(VllmNgramProposer, Proposer):
             set_num_threads(desired_threads)
             self._current_numba_threads = desired_threads
 
-        resolved_search_window = search_window if search_window is not None else \
+        batch_propose_numba(
+            valid_ngram_requests,
+            num_tokens_no_spec,
+            token_ids_cpu,
+            self.min_n,
+            self.max_n,
+            search_window if search_window is not None else
             (self.search_window if self.search_window is not None
-             else self.default_search_window)
-        resolved_draft_k = self.k if draft_k is None else draft_k
-        # For strictly single-request batches, the parallel launcher overhead
-        # can dominate. Keep 2+ requests on the parallel path to avoid
-        # throughput loss under higher concurrency.
-        if desired_threads == 1 and num_ngram_requests == 1:
-            batch_propose_numba_serial(
-                valid_ngram_requests,
-                num_tokens_no_spec,
-                token_ids_cpu,
-                self.min_n,
-                self.max_n,
-                resolved_search_window,
-                self.max_model_len,
-                resolved_draft_k,
-                self.valid_ngram_draft,
-                self.valid_ngram_num_drafts,
-            )
-        else:
-            batch_propose_numba(
-                valid_ngram_requests,
-                num_tokens_no_spec,
-                token_ids_cpu,
-                self.min_n,
-                self.max_n,
-                resolved_search_window,
-                self.max_model_len,
-                resolved_draft_k,
-                self.valid_ngram_draft,
-                self.valid_ngram_num_drafts,
-            )
+             else self.default_search_window),
+            self.max_model_len,
+            (self.k if draft_k is None else draft_k),
+            self.valid_ngram_draft,
+            self.valid_ngram_num_drafts,
+        )
 
     def materialize_draft_token_ids(
             self, num_requests: int,
@@ -296,10 +277,6 @@ class NgramProposer(VllmNgramProposer, Proposer):
             if num_requests > 0:
                 if self.no_match_backoff_enabled:
                     active_mask = self._req_active_mask[:num_requests]
-                    inactive_indices = np.nonzero(active_mask)[0]
-                    if inactive_indices.size > 0:
-                        self._req_skip_match_steps[inactive_indices] = 0
-                        self._req_no_match_streak[inactive_indices] = 0
                     active_mask[:] = False
                 self._req_skip_match_steps[:num_requests] = 0
                 self._req_no_match_streak[:num_requests] = 0
@@ -307,8 +284,8 @@ class NgramProposer(VllmNgramProposer, Proposer):
 
         if self.no_match_backoff_enabled and num_requests > 0:
             active_mask = self._req_active_mask[:num_requests]
-            prev_active_mask = active_mask.copy()
-            prev_active_indices = np.nonzero(prev_active_mask)[0]
+            prev_active_indices = np.nonzero(active_mask)[0]
+            was_active_for_valid = active_mask[valid_ngram_requests].copy()
             active_mask[:] = False
             active_mask[valid_ngram_requests] = True
             if prev_active_indices.size > 0:
@@ -317,8 +294,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
                 if inactive_prev.size > 0:
                     self._req_skip_match_steps[inactive_prev] = 0
                     self._req_no_match_streak[inactive_prev] = 0
-            newly_active = valid_ngram_requests[
-                ~prev_active_mask[valid_ngram_requests]]
+            newly_active = valid_ngram_requests[~was_active_for_valid]
             if newly_active.size > 0:
                 # Reset reused slots so new requests do not inherit backoff
                 # state from previous occupants.
@@ -506,39 +482,6 @@ def batch_propose_numba(
     valid_ngram_num_drafts: np.ndarray,
 ):
     for i in prange(len(valid_ngram_requests)):
-        idx = valid_ngram_requests[i]
-        num_tokens = num_tokens_no_spec[idx]
-        search_start = 0
-        if search_window > 0 and num_tokens > search_window:
-            search_start = num_tokens - search_window
-        context_token_ids = token_ids_cpu[idx, search_start:num_tokens]
-        start_position, draft_len = _find_longest_matched_ngram_and_propose_tokens(
-            origin_tokens=context_token_ids,
-            min_ngram=min_n,
-            max_ngram=max_n,
-            max_model_len=max_model_len,
-            k=k,
-        )
-        valid_ngram_num_drafts[idx] = draft_len
-        if draft_len > 0:
-            valid_ngram_draft[idx, :draft_len] = context_token_ids[
-                start_position:start_position + draft_len]
-
-
-@njit
-def batch_propose_numba_serial(
-    valid_ngram_requests: np.ndarray,
-    num_tokens_no_spec: np.ndarray,
-    token_ids_cpu: np.ndarray,
-    min_n: int,
-    max_n: int,
-    search_window: int,
-    max_model_len: int,
-    k: int,
-    valid_ngram_draft: np.ndarray,
-    valid_ngram_num_drafts: np.ndarray,
-):
-    for i in range(len(valid_ngram_requests)):
         idx = valid_ngram_requests[i]
         num_tokens = num_tokens_no_spec[idx]
         search_start = 0

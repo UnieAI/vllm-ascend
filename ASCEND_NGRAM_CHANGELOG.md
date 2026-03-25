@@ -549,26 +549,15 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 - 避免 request slot 重用時帶入舊 backoff 狀態導致的誤限流。
 - 目標改善 ngram matcher 的穩定觸發率，特別是 16-concurrency 下 request churn 場景。
 
-## 2026-03-25 - 小批次 matcher 走 serial numba kernel，降低並行啟動固定成本
-背景：`run_batch_match` 一律走 `@njit(parallel=True)` kernel。對 1~2 個 request 的低併發場景，`prange/parallel` 啟動成本可能高於實際匹配工作量。
+## 2026-03-25 - 回退 serial matcher 試驗，並優化 backoff active-mask 快照成本
+背景：serial matcher 兩輪調整後量測為 `56.11 / 669.98`（1/16），16-concurrency 仍明顯回歸，需先撤回；同時保留低風險 CPU 微優化。
 
 修改：
-1. `vllm_ascend/spec_decode/ngram_proposer.py`
-   - 新增 `batch_propose_numba_serial`（`@njit`，非 parallel）實作，語義與 parallel 版本一致。
-   - `run_batch_match` 在 `desired_threads == 1` 且 `num_ngram_requests <= 2` 時改走 serial kernel；其他情況維持原 parallel kernel。
-   - 抽出 `resolved_search_window/resolved_draft_k` 供兩條路徑共用。
+1. 回退 `Use serial numba matcher for tiny ngram batches` 與 `Restrict serial ngram matcher fallback to single-request batches`。
+2. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - 在 backoff active-mask 更新時，`newly_active` 判斷改為只複製 `valid_ngram_requests` 子集（`was_active_for_valid`），避免每步全量 `active_mask.copy()`。
+   - 在 `num_ngram_requests == 0` 分支，移除已被後續全量 reset 覆蓋的重複 subset reset。
 
 影響：
-- 降低低併發下 proposer matcher 的固定 CPU 成本。
-- 目標改善 1 concurrency，並避免 16 concurrency 小批次階段被 parallel launcher 成本拖累。
-
-## 2026-03-25 - 收斂 serial matcher 觸發條件：僅限單 request
-背景：上一版將 serial matcher 套用到 `<=2` requests，目標機量測為 `56.41 / 669.12`（1/16），顯示 16-concurrency 有副作用。
-
-修改：
-1. `vllm_ascend/spec_decode/ngram_proposer.py`
-   - `run_batch_match` 的 serial kernel 觸發條件由 `num_ngram_requests <= 2` 收斂為 `num_ngram_requests == 1`。
-
-影響：
-- 保留單 request 場景降低 parallel launcher 固定成本的收益空間。
-- 避免 2-request microbatch 在高併發下誤走 serial 路徑造成吞吐下降。
+- 先消除 serial matcher 對 16-concurrency 的回歸風險。
+- 在不改匹配策略下，微幅降低 backoff 管理路徑的固定 CPU 開銷。
