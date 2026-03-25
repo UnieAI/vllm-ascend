@@ -314,7 +314,8 @@ class NgramProposer(VllmNgramProposer, Proposer):
             if skip_now_mask.any():
                 skip_reqs = req_indices[skip_now_mask]
                 self._req_skip_match_steps[skip_reqs] -= 1
-            run_requests = req_indices[(~short_mask) & (~skip_now_mask)]
+            # short requests should still run matcher; they only skip backoff.
+            run_requests = req_indices[~skip_now_mask]
         if run_requests.size > 0:
             default_window = self.search_window if self.search_window is not None \
                 else self.default_search_window
@@ -369,26 +370,38 @@ class NgramProposer(VllmNgramProposer, Proposer):
 
                 unmatched_reqs = run_reqs[~matched_mask]
                 if unmatched_reqs.size > 0:
-                    new_streak = self._req_no_match_streak[unmatched_reqs] + 1
-                    self._req_no_match_streak[unmatched_reqs] = new_streak
-                    exp = np.minimum(new_streak - 1, 10)
-                    skip_steps = np.left_shift(
-                        np.ones_like(exp, dtype=np.int32), exp)
-                    max_steps = np.full_like(
-                        skip_steps,
-                        self.no_match_backoff_max_steps,
-                        dtype=np.int32,
-                    )
-                    if self.no_match_backoff_long_ctx_threshold > 0:
-                        unmatched_num_tokens = num_tokens_no_spec[unmatched_reqs]
-                        long_ctx_mask = \
-                            unmatched_num_tokens >= \
-                            self.no_match_backoff_long_ctx_threshold
-                        if long_ctx_mask.any():
-                            max_steps[long_ctx_mask] = \
-                                self.no_match_backoff_max_steps_long_ctx
-                    self._req_skip_match_steps[unmatched_reqs] = np.minimum(
-                        max_steps, skip_steps)
+                    unmatched_num_tokens = num_tokens_no_spec[unmatched_reqs]
+                    long_backoff_mask = (
+                        unmatched_num_tokens >= self.no_match_backoff_min_len)
+                    short_unmatched = unmatched_reqs[~long_backoff_mask]
+                    if short_unmatched.size > 0:
+                        self._req_skip_match_steps[short_unmatched] = 0
+                        self._req_no_match_streak[short_unmatched] = 0
+
+                    long_unmatched = unmatched_reqs[long_backoff_mask]
+                    if long_unmatched.size > 0:
+                        new_streak = self._req_no_match_streak[
+                            long_unmatched] + 1
+                        self._req_no_match_streak[long_unmatched] = new_streak
+                        exp = np.minimum(new_streak - 1, 10)
+                        skip_steps = np.left_shift(
+                            np.ones_like(exp, dtype=np.int32), exp)
+                        max_steps = np.full_like(
+                            skip_steps,
+                            self.no_match_backoff_max_steps,
+                            dtype=np.int32,
+                        )
+                        if self.no_match_backoff_long_ctx_threshold > 0:
+                            long_unmatched_num_tokens = num_tokens_no_spec[
+                                long_unmatched]
+                            long_ctx_mask = (
+                                long_unmatched_num_tokens
+                                >= self.no_match_backoff_long_ctx_threshold)
+                            if long_ctx_mask.any():
+                                max_steps[long_ctx_mask] = \
+                                    self.no_match_backoff_max_steps_long_ctx
+                        self._req_skip_match_steps[long_unmatched] = \
+                            np.minimum(max_steps, skip_steps)
         return draft_token_ids
 
     def propose(self,
