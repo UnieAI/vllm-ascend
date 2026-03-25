@@ -548,3 +548,16 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 影響：
 - 避免 request slot 重用時帶入舊 backoff 狀態導致的誤限流。
 - 目標改善 ngram matcher 的穩定觸發率，特別是 16-concurrency 下 request churn 場景。
+
+## 2026-03-25 - 小批次 matcher 走 serial numba kernel，降低並行啟動固定成本
+背景：`run_batch_match` 一律走 `@njit(parallel=True)` kernel。對 1~2 個 request 的低併發場景，`prange/parallel` 啟動成本可能高於實際匹配工作量。
+
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - 新增 `batch_propose_numba_serial`（`@njit`，非 parallel）實作，語義與 parallel 版本一致。
+   - `run_batch_match` 在 `desired_threads == 1` 且 `num_ngram_requests <= 2` 時改走 serial kernel；其他情況維持原 parallel kernel。
+   - 抽出 `resolved_search_window/resolved_draft_k` 供兩條路徑共用。
+
+影響：
+- 降低低併發下 proposer matcher 的固定 CPU 成本。
+- 目標改善 1 concurrency，並避免 16 concurrency 小批次階段被 parallel launcher 成本拖累。
