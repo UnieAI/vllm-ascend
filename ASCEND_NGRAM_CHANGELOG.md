@@ -561,3 +561,14 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 影響：
 - 降低低併發下 proposer matcher 的固定 CPU 成本。
 - 目標改善 1 concurrency，並避免 16 concurrency 小批次階段被 parallel launcher 成本拖累。
+
+## 2026-03-25 - 收斂 serial matcher 觸發條件：僅限單 request
+背景：上一版將 serial matcher 套用到 `<=2` requests，目標機量測為 `56.41 / 669.12`（1/16），顯示 16-concurrency 有副作用。
+
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - `run_batch_match` 的 serial kernel 觸發條件由 `num_ngram_requests <= 2` 收斂為 `num_ngram_requests == 1`。
+
+影響：
+- 保留單 request 場景降低 parallel launcher 固定成本的收益空間。
+- 避免 2-request microbatch 在高併發下誤走 serial 路徑造成吞吐下降。

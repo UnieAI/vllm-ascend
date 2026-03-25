@@ -222,8 +222,10 @@ class NgramProposer(VllmNgramProposer, Proposer):
             (self.search_window if self.search_window is not None
              else self.default_search_window)
         resolved_draft_k = self.k if draft_k is None else draft_k
-        # For tiny batches, the parallel launcher overhead can dominate.
-        if desired_threads == 1 and num_ngram_requests <= 2:
+        # For strictly single-request batches, the parallel launcher overhead
+        # can dominate. Keep 2+ requests on the parallel path to avoid
+        # throughput loss under higher concurrency.
+        if desired_threads == 1 and num_ngram_requests == 1:
             batch_propose_numba_serial(
                 valid_ngram_requests,
                 num_tokens_no_spec,
