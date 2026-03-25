@@ -512,3 +512,26 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 降低混合批次的 NPU 不必要計算，目標提升 rejection 階段效率並減少 decode 固定延遲。
+
+## 2026-03-25 - 低併發優先策略：放寬 backoff/batch gate 並提高 ngram 匹配召回
+背景：最新量測 `1/16 concurrency = 55 / 676`，低於關閉 ngram 的 `57 / 730`；目前目標是先拉回低併發吞吐，再往 `1.5x` 目標收斂。
+
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - 新增低併發策略參數：
+     - `VLLM_ASCEND_NGRAM_LOW_CONC_REQ_THRESHOLD`（預設 `16`）
+     - `VLLM_ASCEND_NGRAM_LOW_CONC_FULL_WINDOW`（預設 `1`）
+     - `VLLM_ASCEND_NGRAM_LOW_CONC_DISABLE_BACKOFF`（預設 `1`）
+     - `VLLM_ASCEND_NGRAM_LOW_CONC_FORCE_SINGLE_THREAD`（預設 `1`）
+   - 當 ngram 有效 request 數 `<= threshold` 時：
+     - 預設停用 no-match backoff（避免低併發被跳步限流）。
+     - 在未顯式指定 `prompt_lookup_window` 時，改用 full-window matcher（`search_window=0`）提高匹配召回。
+     - matcher 預設固定單執行緒，避免小 batch 的 thread 切換成本。
+
+2. `vllm_ascend/worker/model_runner_v1.py`
+   - 新增 `VLLM_ASCEND_NGRAM_BATCH_GATE_DISABLE_UP_TO_REQS`（預設 `16`）。
+   - batch-quality gate 只在 `num_reqs > disable_up_to_reqs` 時啟用；低併發先不因 coverage/avg_drafts 門檻把 drafts 清空。
+
+影響：
+- 低併發預設改為「先保留 ngram 機會、再觀察收益」，降低保守限流對 1/16 concurrency 的抑制。
+- 若目標機顯示 CPU 成本過高，可透過 env 逐項回退（關閉 full-window、恢復 backoff、開放多執行緒）。
