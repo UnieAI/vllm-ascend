@@ -288,7 +288,8 @@ class NgramProposer(VllmNgramProposer, Proposer):
 
         if self.no_match_backoff_enabled and num_requests > 0:
             active_mask = self._req_active_mask[:num_requests]
-            prev_active_indices = np.nonzero(active_mask)[0]
+            prev_active_mask = active_mask.copy()
+            prev_active_indices = np.nonzero(prev_active_mask)[0]
             active_mask[:] = False
             active_mask[valid_ngram_requests] = True
             if prev_active_indices.size > 0:
@@ -297,6 +298,13 @@ class NgramProposer(VllmNgramProposer, Proposer):
                 if inactive_prev.size > 0:
                     self._req_skip_match_steps[inactive_prev] = 0
                     self._req_no_match_streak[inactive_prev] = 0
+            newly_active = valid_ngram_requests[
+                ~prev_active_mask[valid_ngram_requests]]
+            if newly_active.size > 0:
+                # Reset reused slots so new requests do not inherit backoff
+                # state from previous occupants.
+                self._req_skip_match_steps[newly_active] = 0
+                self._req_no_match_streak[newly_active] = 0
 
         self.valid_ngram_num_drafts[valid_ngram_requests] = 0
         run_requests = valid_ngram_requests

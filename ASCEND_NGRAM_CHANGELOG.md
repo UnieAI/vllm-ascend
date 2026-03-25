@@ -534,3 +534,17 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 先回到較穩定基線，避免在未收斂前持續承擔回歸成本。
+
+## 2026-03-25 - 修正 request slot 重用時殘留 backoff 狀態（stale skip/streak）
+背景：`batch_propose` 在 backoff 模式只重置「上一輪 active、這一輪 inactive」的 request；對於「上一輪 inactive、這一輪 newly active」的 slot，可能繼承前一個 request 的 skip/streak 狀態，造成無故跳過 matcher。
+
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - 在更新 active mask 時保存 `prev_active_mask`。
+   - 對 `newly_active = valid_ngram_requests[~prev_active_mask[valid_ngram_requests]]` 明確重置：
+     - `_req_skip_match_steps[newly_active] = 0`
+     - `_req_no_match_streak[newly_active] = 0`
+
+影響：
+- 避免 request slot 重用時帶入舊 backoff 狀態導致的誤限流。
+- 目標改善 ngram matcher 的穩定觸發率，特別是 16-concurrency 下 request churn 場景。
