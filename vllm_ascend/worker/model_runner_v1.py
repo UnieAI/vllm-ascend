@@ -2008,13 +2008,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 if (num_reqs >= self.ngram_batch_gate_min_reqs and
                     (self.ngram_batch_gate_min_coverage > 0.0
                      or self.ngram_batch_gate_min_avg_drafts > 0.0)):
-                    non_empty_drafts = 0
-                    total_drafts = 0
-                    for row in draft_token_ids:
-                        row_len = len(row)
-                        if row_len > 0:
-                            non_empty_drafts += 1
-                            total_drafts += row_len
+                    draft_lens = np.fromiter(
+                        (len(row) for row in draft_token_ids),
+                        dtype=np.int32,
+                        count=num_reqs,
+                    )
+                    non_empty_drafts = int(np.count_nonzero(draft_lens))
+                    total_drafts = int(np.sum(draft_lens))
                     draft_coverage = non_empty_drafts / num_reqs
                     avg_drafts = total_drafts / num_reqs
                     if (draft_coverage < self.ngram_batch_gate_min_coverage

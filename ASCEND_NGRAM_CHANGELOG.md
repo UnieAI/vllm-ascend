@@ -575,3 +575,18 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 影響：
 - 不改匹配策略與語義，僅減少 no-valid-ngram 步驟的固定 CPU 開銷。
 - 目標提升 16-concurrency 下 proposer/backoff 管理路徑效率，同時避免影響 1-concurrency。
+
+## 2026-03-25 - 向量化 ngram batch gate 統計，移除逐 request Python 迴圈
+背景：`propose_draft_token_ids` 的 ngram batch-quality gate 會每步逐 request 迭代 `draft_token_ids` 計算 coverage/avg_drafts，在 16-concurrency decode loop 形成固定 Python 成本。
+
+修改：
+1. `vllm_ascend/worker/model_runner_v1.py`
+   - 將 batch gate 的統計改為：
+     - `draft_lens = np.fromiter(len(row) for row in draft_token_ids, ...)`
+     - `non_empty_drafts = np.count_nonzero(draft_lens)`
+     - `total_drafts = np.sum(draft_lens)`
+   - 保持原有 gate 閾值與行為不變。
+
+影響：
+- 不改策略語義，僅降低 ngram gate 管理路徑每步 Python 開銷。
+- 目標改善 16-concurrency 的 host 端固定成本，並盡量不影響 1-concurrency。
