@@ -386,12 +386,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 os.environ.get("VLLM_ASCEND_NGRAM_BATCH_GATE_MIN_AVG_DRAFTS",
                                "0.5")),
         )
-        self.ngram_batch_gate_disable_up_to_reqs = max(
-            0,
-            int(
-                os.environ.get(
-                    "VLLM_ASCEND_NGRAM_BATCH_GATE_DISABLE_UP_TO_REQS", "16")),
-        )
         # Adaptive ngram cooldown gate:
         # If recent speculative gain remains low, skip proposer for a few
         # steps to avoid paying proposer/rejection overhead continuously.
@@ -2011,11 +2005,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         for row in draft_token_ids
                     ]
                 num_reqs = len(draft_token_ids)
-                gate_enabled = (
-                    num_reqs > self.ngram_batch_gate_disable_up_to_reqs
-                    and num_reqs >= self.ngram_batch_gate_min_reqs
-                )
-                if (gate_enabled and
+                if (num_reqs >= self.ngram_batch_gate_min_reqs and
                     (self.ngram_batch_gate_min_coverage > 0.0
                      or self.ngram_batch_gate_min_avg_drafts > 0.0)):
                     non_empty_drafts = 0

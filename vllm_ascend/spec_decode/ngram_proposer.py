@@ -123,22 +123,6 @@ class NgramProposer(VllmNgramProposer, Proposer):
                 os.environ.get(
                     "VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_WINDOW_STREAK", "2")),
         )
-        self.low_conc_req_threshold = max(
-            0,
-            int(
-                os.environ.get("VLLM_ASCEND_NGRAM_LOW_CONC_REQ_THRESHOLD",
-                               "16")),
-        )
-        self.low_conc_full_window = bool(
-            int(os.environ.get("VLLM_ASCEND_NGRAM_LOW_CONC_FULL_WINDOW", "1")))
-        self.low_conc_disable_backoff = bool(
-            int(
-                os.environ.get(
-                    "VLLM_ASCEND_NGRAM_LOW_CONC_DISABLE_BACKOFF", "1")))
-        self.low_conc_force_single_thread = bool(
-            int(
-                os.environ.get(
-                    "VLLM_ASCEND_NGRAM_LOW_CONC_FORCE_SINGLE_THREAD", "1")))
         self._req_skip_match_steps = np.zeros(max_num_seqs, dtype=np.int32)
         self._req_no_match_streak = np.zeros(max_num_seqs, dtype=np.int32)
         # Tracks requests that were active in the previous step to avoid
@@ -218,8 +202,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
                         num_tokens_no_spec: np.ndarray,
                         token_ids_cpu: np.ndarray,
                         search_window: int | None = None,
-                        draft_k: int | None = None,
-                        force_single_thread: bool = False) -> None:
+                        draft_k: int | None = None) -> None:
         num_ngram_requests = len(valid_ngram_requests)
         if not num_ngram_requests:
             return
@@ -227,11 +210,10 @@ class NgramProposer(VllmNgramProposer, Proposer):
             self._current_numba_threads = 1
             set_num_threads(self._current_numba_threads)
         desired_threads = 1
-        if not force_single_thread:
-            total_tokens = int(np.sum(num_tokens_no_spec[valid_ngram_requests]))
-            if total_tokens >= self.num_tokens_threshold:
-                desired_threads = min(self.num_numba_thread_available,
-                                      num_ngram_requests)
+        total_tokens = int(np.sum(num_tokens_no_spec[valid_ngram_requests]))
+        if total_tokens >= self.num_tokens_threshold:
+            desired_threads = min(self.num_numba_thread_available,
+                                  num_ngram_requests)
         if desired_threads != self._current_numba_threads:
             set_num_threads(desired_threads)
             self._current_numba_threads = desired_threads
@@ -291,13 +273,6 @@ class NgramProposer(VllmNgramProposer, Proposer):
                       token_ids_cpu: np.ndarray) -> list[list[int]]:
         self._ensure_request_backoff_state(num_requests)
         num_ngram_requests = len(valid_ngram_requests)
-        low_conc_mode = (
-            self.low_conc_req_threshold > 0
-            and num_ngram_requests <= self.low_conc_req_threshold
-        )
-        use_backoff = self.no_match_backoff_enabled and not (
-            low_conc_mode and self.low_conc_disable_backoff
-        )
         if num_ngram_requests == 0:
             if num_requests > 0:
                 if self.no_match_backoff_enabled:
@@ -311,7 +286,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
                 self._req_no_match_streak[:num_requests] = 0
             return [[] for _ in range(num_requests)]
 
-        if use_backoff and num_requests > 0:
+        if self.no_match_backoff_enabled and num_requests > 0:
             active_mask = self._req_active_mask[:num_requests]
             prev_active_indices = np.nonzero(active_mask)[0]
             active_mask[:] = False
@@ -325,7 +300,7 @@ class NgramProposer(VllmNgramProposer, Proposer):
 
         self.valid_ngram_num_drafts[valid_ngram_requests] = 0
         run_requests = valid_ngram_requests
-        if use_backoff:
+        if self.no_match_backoff_enabled:
             req_indices = valid_ngram_requests
             token_counts = num_tokens_no_spec[req_indices]
             short_mask = token_counts < self.no_match_backoff_min_len
@@ -343,17 +318,11 @@ class NgramProposer(VllmNgramProposer, Proposer):
         if run_requests.size > 0:
             default_window = self.search_window if self.search_window is not None \
                 else self.default_search_window
-            if (low_conc_mode and self.low_conc_full_window
-                    and self.search_window is None):
-                default_window = 0
             use_window_backoff = (
-                use_backoff
+                self.no_match_backoff_enabled
                 and self.no_match_backoff_window > 0
                 and (default_window == 0
                      or default_window > self.no_match_backoff_window))
-            force_single_thread = (
-                low_conc_mode and self.low_conc_force_single_thread
-            )
             if use_window_backoff:
                 streaks = self._req_no_match_streak[run_requests]
                 backoff_window_mask = \
@@ -367,7 +336,6 @@ class NgramProposer(VllmNgramProposer, Proposer):
                         token_ids_cpu,
                         search_window=default_window,
                         draft_k=self.k,
-                        force_single_thread=force_single_thread,
                     )
                 if run_requests_backoff.size > 0:
                     self.run_batch_match(
@@ -376,7 +344,6 @@ class NgramProposer(VllmNgramProposer, Proposer):
                         token_ids_cpu,
                         search_window=self.no_match_backoff_window,
                         draft_k=self.k,
-                        force_single_thread=force_single_thread,
                     )
             else:
                 self.run_batch_match(
@@ -385,14 +352,13 @@ class NgramProposer(VllmNgramProposer, Proposer):
                     token_ids_cpu,
                     search_window=default_window,
                     draft_k=self.k,
-                    force_single_thread=force_single_thread,
                 )
 
         draft_token_ids = self.materialize_draft_token_ids(
             num_requests,
             valid_ngram_requests,
         )
-        if use_backoff:
+        if self.no_match_backoff_enabled:
             run_reqs = run_requests
             if run_reqs.size > 0:
                 matched_mask = self.valid_ngram_num_drafts[run_reqs] > 0
