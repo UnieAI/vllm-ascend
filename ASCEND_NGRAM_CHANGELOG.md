@@ -540,3 +540,19 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 影響：
 - 保留 no-match backoff 在長上下文的 CPU 降載效果，同時避免短上下文被策略性關閉 matcher。
 - 目標提升 1/16 concurrency 下 ngram draft 覆蓋率與有效接受率，改善吞吐。
+
+## 2026-03-25 - 將 greedy rejection 路徑改為 token-level，移除矩陣中間張量
+背景：`rejection_greedy_sample_pytorch` 原本會建立 `[batch, max_spec_len]` 的 `pos/mismatch/copy` 矩陣並做布林拼接，對高頻 decode 步驟有固定 NPU/記憶體成本。
+
+修改：
+1. `vllm_ascend/sample/rejection_sampler.py`
+   - `rejection_greedy_sample_pytorch` 改為 token-level 計算：
+     - 直接用 `token_req_ids/token_positions` 建立 mismatch token 索引。
+     - 重用 `_compute_first_reject_pos`（`scatter_reduce_(amin)` + fallback）求每 request 首個 mismatch。
+     - 以 token mask 直接寫回 accepted token，移除 `pos_matrix/mismatch_matrix/copy_mask` 中間配置。
+   - `draft_tokens_per_req` 不再由 Python list 轉 tensor，改由 `cu_num_draft_tokens` 在 device 上差分計算。
+   - `rejection_sample` 與 `rejection_sample_ngram_from_logits` 的 greedy 呼叫同步走新簽名。
+
+影響：
+- 降低 greedy 路徑每步固定張量配置與布林矩陣運算成本。
+- 目標改善 1/16 concurrency 下 rejection sampler 的固定開銷，降低 ngram 相對 decode-only 的負擔。

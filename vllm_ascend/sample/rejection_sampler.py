@@ -253,7 +253,6 @@ def rejection_sample_ngram_from_logits(
                 draft_token_ids,
                 target_argmax,
                 bonus_token_ids.unsqueeze(1),
-                num_draft_tokens,
                 max_spec_len,
                 is_greedy,
             )
@@ -427,7 +426,6 @@ def rejection_sample(
                 draft_token_ids,
                 target_argmax,
                 bonus_token_ids,
-                num_draft_tokens,
                 max_spec_len,
                 is_greedy,
             )
@@ -594,67 +592,64 @@ def rejection_greedy_sample_pytorch(
         draft_token_ids,  # [num_tokens]
         target_argmax,  # [num_tokens]
         bonus_token_ids,  # [batch_size]
-        draft_tokens_per_req,  # [batch_size], list
         max_spec_len,
         is_greedy=None,  # [batch_size] or None
 ):
     batch_size = output_token_ids.size(0)
     num_tokens = draft_token_ids.size(0)
     device = output_token_ids.device
-    draft_tokens_per_req = torch.tensor(draft_tokens_per_req).to(
-        device, non_blocking=True)
+    cu_num_draft_tokens = cu_num_draft_tokens.to(device=device, dtype=torch.long)
+    draft_tokens_per_req = torch.empty_like(cu_num_draft_tokens)
+    draft_tokens_per_req[0] = cu_num_draft_tokens[0]
+    if batch_size > 1:
+        draft_tokens_per_req[1:] = (cu_num_draft_tokens[1:]
+                                    - cu_num_draft_tokens[:-1])
     if is_greedy is None:
         is_greedy = torch.ones(batch_size, dtype=torch.bool, device=device)
+    bonus_token_ids = bonus_token_ids.squeeze(1)
 
-    start_indices = cu_num_draft_tokens - draft_tokens_per_req
-    req_ids = torch.arange(batch_size, device=device)
-    token_req_ids = torch.repeat_interleave(req_ids, draft_tokens_per_req)
-    token_positions = torch.arange(
-        num_tokens, device=device) - start_indices[token_req_ids]
+    first_mismatch_pos_per_req = torch.full((batch_size,),
+                                            max_spec_len,
+                                            dtype=torch.long,
+                                            device=device)
+    if num_tokens > 0:
+        start_indices = cu_num_draft_tokens - draft_tokens_per_req
+        req_ids = torch.arange(batch_size, device=device, dtype=torch.long)
+        token_req_ids = torch.repeat_interleave(req_ids, draft_tokens_per_req)
+        token_positions = (torch.arange(num_tokens,
+                                        device=device,
+                                        dtype=torch.long)
+                           - start_indices[token_req_ids])
+        token_is_greedy = is_greedy[token_req_ids]
+        mismatch_global = token_is_greedy & (draft_token_ids != target_argmax)
+        reject_req_ids = token_req_ids[mismatch_global]
+        reject_positions = token_positions[mismatch_global]
+        first_mismatch_pos_per_req = _compute_first_reject_pos(
+            batch_size=batch_size,
+            max_spec_len=max_spec_len,
+            reject_req_ids=reject_req_ids,
+            reject_token_positions=reject_positions,
+            device=device,
+        )
+        no_mismatch_mask = first_mismatch_pos_per_req == max_spec_len
+        if no_mismatch_mask.any():
+            first_mismatch_pos_per_req[no_mismatch_mask] = \
+                draft_tokens_per_req[no_mismatch_mask]
 
-    # Find the first mismatch position of each request.
-    mismatch_global = (draft_token_ids != target_argmax)
-    if max_spec_len == 0:
-        first_mismatch_pos_per_req = torch.zeros(batch_size,
-                                                 dtype=torch.long,
-                                                 device=device)
+        accepted_mask = token_is_greedy & (
+            token_positions <= first_mismatch_pos_per_req[token_req_ids])
+        if accepted_mask.any():
+            output_token_ids[token_req_ids[accepted_mask],
+                             token_positions[accepted_mask]] = \
+                target_argmax[accepted_mask].to(output_token_ids.dtype)
     else:
-        # [bs, max_spec_len]
-        pos_matrix = torch.full((batch_size, max_spec_len),
-                                -1,
-                                dtype=torch.long,
-                                device=device)
-        pos_matrix[token_req_ids, token_positions] = token_positions
-        mismatch_matrix = torch.full((batch_size, max_spec_len),
-                                     False,
-                                     dtype=torch.bool,
-                                     device=device)
-        mismatch_matrix[token_req_ids, token_positions] = mismatch_global
-        mismatch_positions = torch.where(mismatch_matrix, pos_matrix,
-                                         max_spec_len * 2)
-        first_mismatch_pos_per_req, _ = torch.min(mismatch_positions, dim=1)
-        no_mismatch_mask = (first_mismatch_pos_per_req == max_spec_len * 2)
-        first_mismatch_pos_per_req[no_mismatch_mask] = draft_tokens_per_req[
-            no_mismatch_mask]
+        first_mismatch_pos_per_req = draft_tokens_per_req
 
-    # Copy matched target tokens into output.
-    copy_len = torch.minimum(first_mismatch_pos_per_req + 1,
-                             draft_tokens_per_req)
-    copy_indices = torch.arange(max_spec_len + 1,
-                                device=device).expand(batch_size, -1)
-    copy_mask = copy_indices < copy_len.unsqueeze(1)
-    greedy_mask = is_greedy.unsqueeze(1)
-    final_copy_mask = copy_mask & greedy_mask
-    global_idx = start_indices.unsqueeze(1) + copy_indices
-    output_token_ids[final_copy_mask] = target_argmax[
-        global_idx[final_copy_mask]].to(output_token_ids.dtype)
-    # Fill bonus token.
     needs_bonus = is_greedy & (first_mismatch_pos_per_req
                                >= draft_tokens_per_req)
-    if torch.any(needs_bonus):
+    if needs_bonus.any():
         bonus_rows = torch.where(needs_bonus)[0]
         bonus_cols = draft_tokens_per_req[bonus_rows]
-        bonus_token_ids = bonus_token_ids.squeeze(1)
         output_token_ids[bonus_rows, bonus_cols] = bonus_token_ids[bonus_rows]
 
 
