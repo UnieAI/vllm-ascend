@@ -535,3 +535,17 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 影響：
 - 低併發預設改為「先保留 ngram 機會、再觀察收益」，降低保守限流對 1/16 concurrency 的抑制。
 - 若目標機顯示 CPU 成本過高，可透過 env 逐項回退（關閉 full-window、恢復 backoff、開放多執行緒）。
+
+## 2026-03-25 - 修復 low-concurrency 參數在 warmup 期未初始化導致啟動崩潰
+背景：`NgramProposer` 基類初始化期間可能先呼叫 `propose()/batch_propose()`，而 low-concurrency 參數尚未建立，觸發 `AttributeError: low_conc_req_threshold`。
+
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - 在 `super().__init__` 前預先初始化 low-concurrency 欄位安全預設：
+     - `low_conc_req_threshold`
+     - `low_conc_full_window`
+     - `low_conc_disable_backoff`
+     - `low_conc_force_single_thread`
+
+影響：
+- 修復服務啟動期 crash，確保 warmup 階段進入 `batch_propose` 不會因屬性缺失中斷。

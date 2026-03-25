@@ -33,6 +33,12 @@ class NgramProposer(VllmNgramProposer, Proposer):
         self._req_skip_match_steps = np.zeros(0, dtype=np.int32)
         self._req_no_match_streak = np.zeros(0, dtype=np.int32)
         self._req_active_mask = np.zeros(0, dtype=np.bool_)
+        # Low-concurrency tuning knobs are read after base init, but base
+        # init may warm up through propose()/batch_propose first.
+        self.low_conc_req_threshold = 0
+        self.low_conc_full_window = False
+        self.low_conc_disable_backoff = False
+        self.low_conc_force_single_thread = False
         super().__init__(vllm_config)
         assert vllm_config.speculative_config is not None
         assert vllm_config.speculative_config.prompt_lookup_min is not None
