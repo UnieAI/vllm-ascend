@@ -274,12 +274,13 @@ class NgramProposer(VllmNgramProposer, Proposer):
         self._ensure_request_backoff_state(num_requests)
         num_ngram_requests = len(valid_ngram_requests)
         if num_ngram_requests == 0:
-            if num_requests > 0:
-                if self.no_match_backoff_enabled:
-                    active_mask = self._req_active_mask[:num_requests]
-                    active_mask[:] = False
-                self._req_skip_match_steps[:num_requests] = 0
-                self._req_no_match_streak[:num_requests] = 0
+            if self.no_match_backoff_enabled and num_requests > 0:
+                active_mask = self._req_active_mask[:num_requests]
+                prev_active_indices = np.nonzero(active_mask)[0]
+                if prev_active_indices.size > 0:
+                    self._req_skip_match_steps[prev_active_indices] = 0
+                    self._req_no_match_streak[prev_active_indices] = 0
+                active_mask[:] = False
             return [[] for _ in range(num_requests)]
 
         if self.no_match_backoff_enabled and num_requests > 0:

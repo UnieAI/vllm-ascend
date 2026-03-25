@@ -561,3 +561,17 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 影響：
 - 先消除 serial matcher 對 16-concurrency 的回歸風險。
 - 在不改匹配策略下，微幅降低 backoff 管理路徑的固定 CPU 開銷。
+
+## 2026-03-25 - no-valid-ngram 快路徑：移除每步全量 backoff 狀態清零
+背景：當 `num_ngram_requests == 0` 時，原邏輯每步都會對 `[:num_requests]` 做全量 `_req_skip_match_steps/_req_no_match_streak` 清零。這在高頻 decode loop 屬固定 CPU 寫入成本，且多數情況可由 active-slot reset + newly-active reset 保證正確性。
+
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - 在 `num_ngram_requests == 0` 分支：
+     - 僅在 backoff 開啟時，重置「上一步 active」的 request slots。
+     - 移除對全部 `[:num_requests]` 的每步清零。
+     - 維持 `active_mask[:] = False`，讓後續 `newly_active` 路徑在 request 再次有效時正確重置狀態。
+
+影響：
+- 不改匹配策略與語義，僅減少 no-valid-ngram 步驟的固定 CPU 開銷。
+- 目標提升 16-concurrency 下 proposer/backoff 管理路徑效率，同時避免影響 1-concurrency。
