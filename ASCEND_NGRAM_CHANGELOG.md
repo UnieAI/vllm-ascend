@@ -525,22 +525,6 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 
 影響：
 - 修復服務啟動期 crash，確保 warmup 階段進入 `batch_propose` 不會因屬性缺失中斷。
-
-## 2026-03-25 - 修正 backoff 對短上下文的誤限流：短上下文仍執行 matcher
-背景：目前 `no_match_backoff_min_len`（預設 256）邏輯會把短上下文 request 直接排除在 `run_requests` 外，導致短上下文幾乎不產生 ngram draft，低併發吞吐受抑制。
-
-修改：
-1. `vllm_ascend/spec_decode/ngram_proposer.py`
-   - `batch_propose` 中 backoff 篩選改為：
-     - 只有「長上下文且 skip_remaining > 0」才跳過本步 matcher。
-     - 短上下文 request（`num_tokens < no_match_backoff_min_len`）仍會進入 matcher。
-   - unmatched 後的 backoff 狀態更新改為僅對長上下文 request 累積 streak/skip。
-   - 短上下文 unmatched request 明確重設 skip/streak，避免被帶入退避狀態。
-
-影響：
-- 保留 no-match backoff 在長上下文的 CPU 降載效果，同時避免短上下文被策略性關閉 matcher。
-- 目標提升 1/16 concurrency 下 ngram draft 覆蓋率與有效接受率，改善吞吐。
-
 ## 2026-03-25 - 將 greedy rejection 路徑改為 token-level，移除矩陣中間張量
 背景：`rejection_greedy_sample_pytorch` 原本會建立 `[batch, max_spec_len]` 的 `pos/mismatch/copy` 矩陣並做布林拼接，對高頻 decode 步驟有固定 NPU/記憶體成本。
 
