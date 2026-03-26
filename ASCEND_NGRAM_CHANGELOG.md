@@ -590,3 +590,29 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 影響：
 - 不改策略語義，僅降低 ngram gate 管理路徑每步 Python 開銷。
 - 目標改善 16-concurrency 的 host 端固定成本，並盡量不影響 1-concurrency。
+
+## 2026-03-26 - 精簡 proposer backoff bookkeeping 與 thread 決策熱路徑
+背景：`batch_propose` 的 backoff 管理仍在每步做 `np.nonzero`/inactive 掃描；`run_batch_match` 在明顯單執行緒場景也會計算 `total_tokens`。低併發下這些固定 CPU 成本容易抵消 ngram 收益。
+
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - `num_ngram_requests == 0` 分支改為只清 `active_mask`，移除 inactive 全量索引掃描與清零。
+   - active 更新時只保留 `newly_active` reset（`_req_skip_match_steps/_req_no_match_streak`），移除 `prev_active_indices` / `inactive_prev` 路徑。
+   - `run_batch_match` 僅在「可能啟用多執行緒」時才計算 `total_tokens`；小 batch 直接維持單執行緒決策。
+
+影響：
+- 不改 matcher/backoff 策略本身，僅降低 proposer 管理路徑固定 CPU 開銷。
+- 目標是提升低併發（特別是 1/16 concurrency）下 ngram 模式的 steady-state 吞吐與穩定度。
+
+## 2026-03-26 - 優化 ngram logits 接受判定與 fast-recover 型別轉換開銷
+背景：同參數下 16-concurrency 吞吐仍落後 baseline，且觀察到 NPU 未吃滿，懷疑 rejection sampler 的算子路徑與型別轉換仍有固定成本。
+
+修改：
+1. `vllm_ascend/sample/rejection_sampler.py`
+   - `rejection_sample_ngram_from_logits` 的接受判定，從 `gather + logsumexp` 改為 `log_softmax + gather`，優先走融合度較高的 log-prob 計算路徑。
+   - 在 ngram `fast recover argmax` 路徑移除不必要的 `to(torch.float32)`，直接在原 dtype 上做 masked argmax。
+   - 僅在非 fast-recover 路徑保留 `float32` 轉換（避免精度/數值風險擴散到一般路徑）。
+
+影響：
+- 不改 ngram 接受/恢復語義，僅降低 rejection sampler 的 NPU/記憶體搬運固定開銷。
+- 目標是提升同參數下 16-concurrency output throughput，縮小與 baseline 差距。

@@ -210,10 +210,11 @@ class NgramProposer(VllmNgramProposer, Proposer):
             self._current_numba_threads = 1
             set_num_threads(self._current_numba_threads)
         desired_threads = 1
-        total_tokens = int(np.sum(num_tokens_no_spec[valid_ngram_requests]))
-        if total_tokens >= self.num_tokens_threshold:
-            desired_threads = min(self.num_numba_thread_available,
-                                  num_ngram_requests)
+        if self.num_numba_thread_available > 1 and num_ngram_requests > 1:
+            total_tokens = int(np.sum(num_tokens_no_spec[valid_ngram_requests]))
+            if total_tokens >= self.num_tokens_threshold:
+                desired_threads = min(self.num_numba_thread_available,
+                                      num_ngram_requests)
         if desired_threads != self._current_numba_threads:
             set_num_threads(desired_threads)
             self._current_numba_threads = desired_threads
@@ -275,26 +276,16 @@ class NgramProposer(VllmNgramProposer, Proposer):
         num_ngram_requests = len(valid_ngram_requests)
         if num_ngram_requests == 0:
             if self.no_match_backoff_enabled and num_requests > 0:
-                active_mask = self._req_active_mask[:num_requests]
-                prev_active_indices = np.nonzero(active_mask)[0]
-                if prev_active_indices.size > 0:
-                    self._req_skip_match_steps[prev_active_indices] = 0
-                    self._req_no_match_streak[prev_active_indices] = 0
-                active_mask[:] = False
+                # Keep stale state for inactive slots and only clear on
+                # next activation to avoid per-step inactive scans.
+                self._req_active_mask[:num_requests] = False
             return [[] for _ in range(num_requests)]
 
         if self.no_match_backoff_enabled and num_requests > 0:
             active_mask = self._req_active_mask[:num_requests]
-            prev_active_indices = np.nonzero(active_mask)[0]
-            was_active_for_valid = active_mask[valid_ngram_requests].copy()
+            was_active_for_valid = active_mask[valid_ngram_requests]
             active_mask[:] = False
             active_mask[valid_ngram_requests] = True
-            if prev_active_indices.size > 0:
-                inactive_prev = prev_active_indices[
-                    ~active_mask[prev_active_indices]]
-                if inactive_prev.size > 0:
-                    self._req_skip_match_steps[inactive_prev] = 0
-                    self._req_no_match_streak[inactive_prev] = 0
             newly_active = valid_ngram_requests[~was_active_for_valid]
             if newly_active.size > 0:
                 # Reset reused slots so new requests do not inherit backoff

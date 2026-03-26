@@ -390,12 +390,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # If recent speculative gain remains low, skip proposer for a few
         # steps to avoid paying proposer/rejection overhead continuously.
         self.ngram_adaptive_gate_enabled = bool(
-            int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_GATE", "0")))
+            int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_GATE", "1")))
         self.ngram_adaptive_gain_threshold = max(
             0.0,
             float(
                 os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_GAIN_THRESHOLD",
-                               "0.08")),
+                               "0.16")),
         )
         self.ngram_adaptive_gain_decay = min(
             0.99,
@@ -409,29 +409,29 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.ngram_adaptive_patience_steps = max(
             1,
             int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_PATIENCE",
-                               "3")),
+                               "2")),
         )
         self.ngram_adaptive_cooldown_steps = max(
             1,
             int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_COOLDOWN",
-                               "4")),
+                               "12")),
         )
         self.ngram_adaptive_warmup_steps = max(
             0,
-            int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_WARMUP", "8")),
+            int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_WARMUP", "4")),
         )
         self.ngram_adaptive_soft_cap_enabled = bool(
-            int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_SOFT_CAP", "0")))
+            int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_SOFT_CAP", "1")))
         self.ngram_adaptive_soft_gain_threshold = max(
             0.0,
             float(
                 os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_SOFT_GAIN_THRESHOLD",
-                               "0.16")),
+                               "0.30")),
         )
         self.ngram_adaptive_soft_max_drafts = max(
             1,
             int(os.environ.get("VLLM_ASCEND_NGRAM_ADAPTIVE_SOFT_MAX_DRAFTS",
-                               "2")),
+                               "1")),
         )
         self._ngram_adaptive_step = 0
         self._ngram_adaptive_gain_ema = 0.0
