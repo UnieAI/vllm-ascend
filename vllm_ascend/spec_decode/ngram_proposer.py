@@ -33,11 +33,15 @@ class NgramProposer(VllmNgramProposer, Proposer):
         self._req_skip_match_steps = np.zeros(0, dtype=np.int32)
         self._req_no_match_streak = np.zeros(0, dtype=np.int32)
         self._req_active_mask = np.zeros(0, dtype=np.bool_)
+        self.max_match_reqs_per_step = 0
+        self._match_rr_cursor = 0
         # Low-concurrency tuning knobs are read after base init, but base
         # init may warm up through propose()/batch_propose first.
         self.low_conc_req_threshold = 0
-        self.low_conc_full_window = False
         self.low_conc_disable_backoff = False
+        self.low_conc_hard_rescan_enabled = False
+        self.low_conc_hard_rescan_min_streak = 0
+        self.low_conc_hard_rescan_max_reqs = 0
         self.low_conc_force_single_thread = False
         super().__init__(vllm_config)
         assert vllm_config.speculative_config is not None
@@ -123,6 +127,39 @@ class NgramProposer(VllmNgramProposer, Proposer):
                 os.environ.get(
                     "VLLM_ASCEND_NGRAM_NO_MATCH_BACKOFF_WINDOW_STREAK", "2")),
         )
+        self.max_match_reqs_per_step = max(
+            0,
+            int(
+                os.environ.get("VLLM_ASCEND_NGRAM_MAX_MATCH_REQS_PER_STEP",
+                               "8")),
+        )
+        self.low_conc_req_threshold = max(
+            0,
+            int(
+                os.environ.get("VLLM_ASCEND_NGRAM_LOW_CONC_REQ_THRESHOLD",
+                               "16")),
+        )
+        self.low_conc_disable_backoff = bool(
+            int(
+                os.environ.get("VLLM_ASCEND_NGRAM_LOW_CONC_DISABLE_BACKOFF",
+                               "1")))
+        self.low_conc_hard_rescan_enabled = bool(
+            int(
+                os.environ.get("VLLM_ASCEND_NGRAM_LOW_CONC_HARD_RESCAN",
+                               "1")))
+        self.low_conc_hard_rescan_min_streak = max(
+            0,
+            int(
+                os.environ.get("VLLM_ASCEND_NGRAM_LOW_CONC_HARD_RESCAN_MIN_STREAK",
+                               "2")),
+        )
+        self.low_conc_hard_rescan_max_reqs = max(
+            0,
+            int(
+                os.environ.get("VLLM_ASCEND_NGRAM_LOW_CONC_HARD_RESCAN_MAX_REQS",
+                               "4")),
+        )
+        self._match_rr_cursor = 0
         self._req_skip_match_steps = np.zeros(max_num_seqs, dtype=np.int32)
         self._req_no_match_streak = np.zeros(max_num_seqs, dtype=np.int32)
         # Tracks requests that were active in the previous step to avoid
@@ -185,9 +222,12 @@ class NgramProposer(VllmNgramProposer, Proposer):
         # based on sampled_ids and max_model_len only.
         valid_ngram_requests = np.empty(len(sampled_token_ids), dtype=np.int32)
         num_valid_requests = 0
+        num_tokens_size = int(num_tokens_no_spec.shape[0])
 
         for i, sampled_ids in enumerate(sampled_token_ids):
             if self._num_sampled_ids(sampled_ids) == 0:
+                continue
+            if i >= num_tokens_size:
                 continue
             num_tokens = num_tokens_no_spec[i]
             if num_tokens >= self.max_model_len:
@@ -268,6 +308,65 @@ class NgramProposer(VllmNgramProposer, Proposer):
         self._req_no_match_streak = new_streak
         self._req_active_mask = new_active
 
+    def _select_match_requests_with_budget(
+            self, run_requests: np.ndarray) -> np.ndarray:
+        budget = self.max_match_reqs_per_step
+        num_candidates = int(run_requests.size)
+        if budget <= 0 or num_candidates <= budget:
+            return run_requests
+        # Keep full matcher coverage for low/medium-concurrency batches.
+        # A hard budget at 2x (e.g. 16 reqs with budget=8) often hurts ngram
+        # acceptance more than the CPU time it saves.
+        if num_candidates <= (budget << 1):
+            return run_requests
+        start = int(self._match_rr_cursor % num_candidates)
+        select_idx = (start + np.arange(budget, dtype=np.int32)) % num_candidates
+        self._match_rr_cursor = (start + budget) % num_candidates
+        return run_requests[select_idx]
+
+    def _rescan_low_conc_hard_unmatched(
+            self, run_requests: np.ndarray, num_tokens_no_spec: np.ndarray,
+            token_ids_cpu: np.ndarray, default_window: int) -> None:
+        if (not self.low_conc_hard_rescan_enabled or default_window <= 0
+                or run_requests.size == 0):
+            return
+        unmatched_mask = self.valid_ngram_num_drafts[run_requests] == 0
+        if not unmatched_mask.any():
+            return
+
+        unmatched_reqs = run_requests[unmatched_mask]
+        # Only re-scan requests whose context is longer than the default window.
+        # Short contexts already get full coverage from the first pass.
+        long_ctx_mask = num_tokens_no_spec[unmatched_reqs] > default_window
+        if not long_ctx_mask.any():
+            return
+        candidate_reqs = unmatched_reqs[long_ctx_mask]
+        if candidate_reqs.size == 0:
+            return
+
+        if self.low_conc_hard_rescan_min_streak > 0:
+            streaks = self._req_no_match_streak[candidate_reqs]
+            streak_mask = streaks >= self.low_conc_hard_rescan_min_streak
+            if not streak_mask.any():
+                return
+            candidate_reqs = candidate_reqs[streak_mask]
+            streaks = streaks[streak_mask]
+        else:
+            streaks = self._req_no_match_streak[candidate_reqs]
+
+        max_rescan_reqs = self.low_conc_hard_rescan_max_reqs
+        if max_rescan_reqs > 0 and candidate_reqs.size > max_rescan_reqs:
+            top_idx = np.argsort(-streaks)[:max_rescan_reqs]
+            candidate_reqs = candidate_reqs[top_idx]
+
+        self.run_batch_match(
+            candidate_reqs,
+            num_tokens_no_spec,
+            token_ids_cpu,
+            search_window=0,
+            draft_k=self.k,
+        )
+
     def batch_propose(self, num_requests: int,
                       valid_ngram_requests: np.ndarray,
                       num_tokens_no_spec: np.ndarray,
@@ -295,7 +394,16 @@ class NgramProposer(VllmNgramProposer, Proposer):
 
         self.valid_ngram_num_drafts[valid_ngram_requests] = 0
         run_requests = valid_ngram_requests
-        if self.no_match_backoff_enabled:
+        use_no_match_backoff = self.no_match_backoff_enabled
+        low_conc_no_backoff_mode = False
+        if use_no_match_backoff and self.low_conc_disable_backoff:
+            req_threshold = self.low_conc_req_threshold
+            if req_threshold <= 0:
+                req_threshold = max(16, self.max_match_reqs_per_step << 1)
+            if num_ngram_requests <= req_threshold:
+                use_no_match_backoff = False
+                low_conc_no_backoff_mode = True
+        if use_no_match_backoff:
             req_indices = valid_ngram_requests
             token_counts = num_tokens_no_spec[req_indices]
             short_mask = token_counts < self.no_match_backoff_min_len
@@ -310,11 +418,13 @@ class NgramProposer(VllmNgramProposer, Proposer):
                 skip_reqs = req_indices[skip_now_mask]
                 self._req_skip_match_steps[skip_reqs] -= 1
             run_requests = req_indices[(~short_mask) & (~skip_now_mask)]
+        if run_requests.size > 0 and self.max_match_reqs_per_step > 0:
+            run_requests = self._select_match_requests_with_budget(run_requests)
         if run_requests.size > 0:
             default_window = self.search_window if self.search_window is not None \
                 else self.default_search_window
             use_window_backoff = (
-                self.no_match_backoff_enabled
+                use_no_match_backoff
                 and self.no_match_backoff_window > 0
                 and (default_window == 0
                      or default_window > self.no_match_backoff_window))
@@ -348,12 +458,19 @@ class NgramProposer(VllmNgramProposer, Proposer):
                     search_window=default_window,
                     draft_k=self.k,
                 )
+            if low_conc_no_backoff_mode:
+                self._rescan_low_conc_hard_unmatched(
+                    run_requests,
+                    num_tokens_no_spec,
+                    token_ids_cpu,
+                    default_window,
+                )
 
         draft_token_ids = self.materialize_draft_token_ids(
             num_requests,
             valid_ngram_requests,
         )
-        if self.no_match_backoff_enabled:
+        if use_no_match_backoff:
             run_reqs = run_requests
             if run_reqs.size > 0:
                 matched_mask = self.valid_ngram_num_drafts[run_reqs] > 0
@@ -384,6 +501,16 @@ class NgramProposer(VllmNgramProposer, Proposer):
                                 self.no_match_backoff_max_steps_long_ctx
                     self._req_skip_match_steps[unmatched_reqs] = np.minimum(
                         max_steps, skip_steps)
+        elif self.no_match_backoff_enabled and run_requests.size > 0:
+            matched_mask = self.valid_ngram_num_drafts[run_requests] > 0
+            matched_reqs = run_requests[matched_mask]
+            if matched_reqs.size > 0:
+                self._req_skip_match_steps[matched_reqs] = 0
+                self._req_no_match_streak[matched_reqs] = 0
+            unmatched_reqs = run_requests[~matched_mask]
+            if unmatched_reqs.size > 0:
+                self._req_skip_match_steps[unmatched_reqs] = 0
+                self._req_no_match_streak[unmatched_reqs] += 1
         return draft_token_ids
 
     def propose(self,
@@ -418,10 +545,20 @@ class NgramProposer(VllmNgramProposer, Proposer):
                            sampled_token_lens: np.ndarray | None = None,
                            candidate_indices: np.ndarray | None = None
                            ) -> list[list[int]]:
-        num_tokens_no_spec = self.runner.input_batch.num_tokens_no_spec
-        token_ids_cpu = self.runner.input_batch.token_ids_cpu
-        num_tokens_snapshot = self.runner.input_batch.num_tokens
         num_requests = len(valid_sampled_token_ids)
+        input_batch = getattr(self.runner, "input_batch", None)
+        if input_batch is None \
+                or not hasattr(input_batch, "num_tokens_no_spec") \
+                or not hasattr(input_batch, "token_ids_cpu") \
+                or not hasattr(input_batch, "num_tokens"):
+            # Some async/warmup code paths can trigger ngram proposal before the
+            # runner input batch is initialized. Keep decoding alive by
+            # returning no ngram drafts for this step.
+            return [[] for _ in range(num_requests)]
+
+        num_tokens_no_spec = input_batch.num_tokens_no_spec
+        token_ids_cpu = input_batch.token_ids_cpu
+        num_tokens_snapshot = input_batch.num_tokens
         if candidate_indices is None:
             if sampled_token_lens is None:
                 sampled_token_lens = np.fromiter(

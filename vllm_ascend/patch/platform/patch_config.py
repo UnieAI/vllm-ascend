@@ -1,8 +1,20 @@
 import ast
+import os
 
 import vllm.envs as envs
 from vllm.config.speculative import SpeculativeConfig
 from vllm.logger import logger
+
+
+def _read_optional_int_env(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; ignore this override.", name, raw)
+        return None
 
 
 def __post_init__(self):
@@ -229,6 +241,32 @@ def __post_init__(self):
                 SpeculativeConfig.create_draft_parallel_config(
                     self.target_parallel_config,
                     self.draft_tensor_parallel_size))
+
+    # DSC-style speculative load controls:
+    # 1) keep compatibility with old vLLM versions by injecting attrs when
+    #    absent, and
+    # 2) allow env/CLI override even if upstream fields already exist.
+    if getattr(self, "enable_load", None) is None:
+        self.enable_load = 120000
+    if getattr(self, "disable_load", None) is None:
+        self.disable_load = 180000
+    if getattr(self, "cooldown_sec", None) is None:
+        self.cooldown_sec = 30
+
+    env_enable_load = _read_optional_int_env("VLLM_ASCEND_SPEC_ENABLE_LOAD")
+    env_disable_load = _read_optional_int_env("VLLM_ASCEND_SPEC_DISABLE_LOAD")
+    env_cooldown_sec = _read_optional_int_env("VLLM_ASCEND_SPEC_COOLDOWN_SEC")
+    if env_enable_load is not None:
+        self.enable_load = env_enable_load
+    if env_disable_load is not None:
+        self.disable_load = env_disable_load
+    if env_cooldown_sec is not None:
+        self.cooldown_sec = env_cooldown_sec
+
+    if self.enable_load >= self.disable_load:
+        raise ValueError(
+            f"enable_load={self.enable_load} must be < "
+            f"disable_load={self.disable_load}")
 
 
 SpeculativeConfig.__post_init__ = __post_init__

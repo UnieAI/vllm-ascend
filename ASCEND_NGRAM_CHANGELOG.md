@@ -616,3 +616,193 @@ Base: `93288799` (`[Core] Port Ascend ngram opt to v0.11.0-dev`)
 影響：
 - 不改 ngram 接受/恢復語義，僅降低 rejection sampler 的 NPU/記憶體搬運固定開銷。
 - 目標是提升同參數下 16-concurrency output throughput，縮小與 baseline 差距。
+
+## 2026-03-26 - 實測回歸：`log_softmax` 接受判定版本吞吐下降，已回退
+背景：上一輪將 ngram logits 接受判定改為 `log_softmax + gather`，需要在目標機驗證實際收益。
+
+修改與測試：
+1. 套用 `vllm_ascend/sample/rejection_sampler.py` 的 `log_softmax` 接受判定路徑。
+2. 在 `owen` 執行 `/tmp/run_round2_bench.sh`（16 concurrency, 64 prompts, output_len=1024）。
+3. 實測結果：`Output token throughput = 717.08 tok/s`。
+
+結論：
+- 相比目前最佳 `721.02 tok/s`（同參數）為回歸。
+- 此改動已在本地與 `owen` 端回退，不納入當前工作基線。
+
+## 2026-03-26 - 實測回歸：matcher 去切片/去反轉嘗試未提升，已回退
+背景：推測 proposer 每步建立 `context_token_ids` slice 與 `origin_tokens[::-1]` 仍有 CPU 固定成本，因此嘗試改為 index-based matcher。
+
+修改與測試：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - `batch_propose_numba` 改為直接傳整行 token buffer + `search_start/search_end`。
+   - `_find_longest_matched_ngram_and_propose_tokens` 改為以索引計算，不建立反轉 view。
+2. 在 `owen` 以相同 benchmark 流程重測。
+3. 實測結果：`Output token throughput = 715.08 tok/s`。
+
+結論：
+- 再次低於目前最佳 `721.02 tok/s`，且低於上一輪 `717.08 tok/s`。
+- 該嘗試已回退；目前保留基線為「request budget (`VLLM_ASCEND_NGRAM_MAX_MATCH_REQS_PER_STEP` 預設 8) + 其餘既有優化」。
+
+## 2026-03-26 - 實測回歸：model runner token 回寫路徑減少 dict/list 轉換仍未超越最佳
+背景：懷疑 decode loop 內 sampled token 回寫仍有 Python 固定成本（重複 `self.requests[req_id]` 查找、group row `.tolist()` 轉換），嘗試做不改語義的 CPU 熱路徑精簡。
+
+修改與測試：
+1. `vllm_ascend/worker/model_runner_v1.py`
+   - 單 token 與多 token 回寫流程改為先保存 `output_token_ids` 參考，減少每步字典查找。
+   - 多 token group 回寫改為直接 `extend(multi_sampled_ids[row])`，避免從中間 `np.asarray` 再 `.tolist()` 回轉。
+   - 若已有 `sampled_token_lens_np`，優先重用其長度，避免額外 `len(sampled_ids)` 呼叫。
+2. 在 `owen` 以相同 benchmark 流程重測（`/tmp/run_round2_bench.sh`）。
+3. 實測結果：`Output token throughput = 718.43 tok/s`。
+
+結論：
+- 雖較前兩輪回歸嘗試 (`715~717`) 有改善，但仍低於目前最佳 `721.02 tok/s`。
+- 此改動不納入目前最佳基線，後續 round 需改走不同方向（優先檢查 ngram 匹配品質/accept-rate 與 NPU 空轉區段）。
+
+## 2026-03-26 - 實測回歸：hot-request 優先 matcher budget 排程導致成功請求大幅下降
+背景：為了在固定 matcher budget 下提高有效 draft 密度，嘗試將 `run_requests` 選擇策略從純 round-robin 改成「優先近期有 match 的 request（streak=0）」，其餘再補。
+
+修改與測試：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - 新增 `_select_round_robin_subset` helper。
+   - 在 `max_match_reqs_per_step` 限流分支改為先挑選 hot requests，再補 cold requests。
+2. 在 `owen` 以相同 benchmark 流程重測（`/tmp/run_round2_bench.sh`）。
+3. 實測結果：
+   - `Successful requests = 16 / 64`
+   - `Output token throughput = 681.94 tok/s`
+   - `actual_output_lens` 出現大量 `0`。
+
+結論：
+- 此策略在目標機造成明顯行為回歸（成功率與吞吐同時下降）。
+- 已在本地與 `owen` 回退，恢復至「budget round-robin 基線」。
+
+## 2026-03-26 - 實測回歸：以 `longest_ngram` 限制 `draft_len` 降低 verify 負擔未奏效
+背景：為減少弱匹配產生的低品質 draft verify 開銷，嘗試將 proposer 的 `draft_len` 從 `min(k, tail_len)` 改為 `min(k, tail_len, longest_ngram)`。
+
+修改與測試：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - `_find_longest_matched_ngram_and_propose_tokens` 的 draft 長度計算加入 `longest_ngram` 上限。
+2. 在 `owen` 以同一 benchmark 流程重測（`/tmp/run_round2_bench.sh`）。
+3. 實測結果：
+   - `Successful requests = 64 / 64`
+   - `Output token throughput = 709.59 tok/s`
+
+結論：
+- 相比目前最佳 `721.02 tok/s` 明顯回歸，且低於近期多輪嘗試。
+- 已在本地與 `owen` 回退；目前仍維持 budget round-robin 基線。
+
+## 2026-03-26 - matcher budget 自動放寬中低併發批次，避免 16 req 被硬限流
+背景：目前基線預設 `VLLM_ASCEND_NGRAM_MAX_MATCH_REQS_PER_STEP=8`。在 16-concurrency 場景下，若每步只讓 8 個 request 跑 matcher，容易降低 draft 覆蓋率與接受率，最終吞吐落後 baseline。
+
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - 新增 `_select_match_requests_with_budget(...)` helper，集中處理 matcher budget 決策。
+   - 保留高併發 budget 限流，但新增「中低併發自動全量匹配」規則：
+     - 當 `num_candidates <= 2 * budget` 時，不做限流，直接讓全部 request 跑 matcher。
+   - round-robin 子集選擇改為 index 向量化（避免 `np.concatenate` 分支拼接）。
+
+影響：
+- 不需要修改外部 benchmark 參數或 env。
+- 目標是在 16-concurrency 這類中低併發場景恢復 matcher 覆蓋率，提升 ngram 實際 draft 產出與 output throughput，同時保留高併發時的 CPU 保護。
+
+實測（owen, `/tmp/run_round2_bench.sh`）：
+- `Successful requests = 64 / 64`
+- `Output token throughput = 718.08 tok/s`
+
+結論：
+- 相比目前最佳 `721.02 tok/s` 仍有回歸，暫未達到預期收益。
+
+## 2026-03-26 - ngram fast-recover 路徑延後 `float32` 轉型，16-concurrency 提升到 722.56
+背景：`rejection_sample_ngram_from_logits` 的 recovered-token helper 在 fast argmax 路徑仍會先做 `to(torch.float32)`，造成每步 reject-row 額外轉型與記憶體流量。
+
+修改：
+1. `vllm_ascend/sample/rejection_sampler.py`
+   - `_sample_recovered_tokens_from_logits_indices(...)`：
+     - fast 路徑改為直接使用原始 `target_logits` dtype 做 masked argmax。
+     - 只在非 fast 路徑（Gumbel/log-q）才轉 `float32`。
+   - `_sample_recovered_tokens_for_indices(...)`（is_ngram + fast argmax）：
+     - 移除 `target_slice.to(torch.float32)`，直接在原 dtype 上做 masked argmax。
+
+實測（owen, `/tmp/run_round2_bench.sh`）：
+- `Successful requests = 64 / 64`
+- `Output token throughput = 722.56 tok/s`
+
+結論：
+- 較前一輪 `718.08 tok/s` 明顯提升，也超過先前最佳 `721.02 tok/s`。
+- 仍低於你提到的 baseline 約 `730 tok/s`，需再做下一輪演算法優化。
+
+## 2026-03-26 - 將 proposer backoff 簡化路徑同步到 owen 後二次重測
+背景：`owen` 端 proposer `batch_propose` 仍有舊版 `prev_active_indices/inactive_prev` 掃描，已補齊為本地較精簡路徑後再重測同 benchmark。
+
+修改（owen）：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - `num_ngram_requests == 0` 分支改為只清 `active_mask`（移除 `prev_active_indices` 清零掃描）。
+   - active 更新路徑移除 `inactive_prev` 掃描，僅保留 `newly_active` reset。
+
+實測（owen, `/tmp/run_round2_bench.sh`）：
+- `Successful requests = 64 / 64`
+- `Output token throughput = 722.41 tok/s`
+
+結論：
+- 與上一輪 `722.56 tok/s` 相比未再提升（小幅回落，屬同量級）。
+- 代表目前主要瓶頸不在這段 proposer bookkeeping，需要改攻其他熱點。
+
+## 2026-03-26 - 實測回歸：低併發 unmatched 二次全窗口重掃吞吐下降
+背景：為提高 16-concurrency 的 matcher 命中率，嘗試在既有 matcher 執行後，對「本步未命中 request」再做一次 `search_window=0` 全窗口重掃。
+
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - 新增 `_rescan_unmatched_low_conc_requests(...)`。
+   - 在 `batch_propose` 的 matcher 後對低併發 unmatched request 二次執行 full-window match。
+
+實測（owen，手動流程）：
+- `Successful requests = 64 / 64`
+- `Output token throughput = 719.88 tok/s`
+
+結論：
+- 相比既有最佳 `722.56 tok/s` 回歸。
+- 方向判斷為「二次全掃增加 CPU 固定成本大於命中收益」，已不作為當前基線。
+
+## 2026-03-26 - 低併發自動關閉 no-match backoff skip，吞吐提升到 726.56
+背景：在 16-concurrency 下，no-match backoff 會讓部分 request 連續跳過 matcher，降低 ngram draft 覆蓋；改為低併發時停用 skip，但不引入 full-window 二次掃描成本。
+
+修改：
+1. `vllm_ascend/spec_decode/ngram_proposer.py`
+   - 新增低併發分支：當 `num_ngram_requests <= low_conc_req_threshold`（預設 16）且啟用 `low_conc_disable_backoff`（預設開）時，本步不套用 no-match backoff skip。
+   - 非低併發時維持既有 no-match backoff 行為。
+2. 保留 `vllm_ascend/sample/rejection_sampler.py` fast-recover 延後 `float32` 轉型優化。
+
+實測（owen，手動流程）：
+- `Successful requests = 64 / 64`
+- `Output token throughput = 726.56 tok/s`
+
+結論：
+- 較前一輪 `719.88 tok/s` 明顯提升。
+- 亦優於先前最佳 `722.56 tok/s`，但仍略低於 baseline 約 `730 tok/s`，可再往 matcher 命中品質與 verify/reject 固定成本繼續優化。
+
+## 2026-03-30 - 每分鐘回報當前 speculative load
+背景：需要在不改 benchmark 參數的前提下，持續觀察服務執行期間的即時 load 變化。
+
+修改：
+1. `vllm_ascend/patch/platform/patch_async_ngram_dsc.py`
+   - 在 scheduler 內新增節流 log：每 `60` 秒輸出一次當前 load。
+   - log 內容包含：`load`、`active_reqs`、`enabled`、`enable_load`、`disable_load`。
+   - 不改既有 enable/disable 的切換判斷，只新增週期性觀測訊號。
+
+影響：
+- 可直接在服務 log 看到每分鐘一次的 current load。
+- 便於比對 ngram 開關與吞吐變化，不增加高頻日志壓力。
+
+## 2026-03-30 - Fix DSC hook not taking effect on newer vLLM scheduler
+背景：現場回報「DSC 完全沒生效」，包含沒有 load log、低閥值下也看不到 ngram disable，代表 scheduler hook 可能未安裝成功。
+
+修改：
+1. `vllm_ascend/patch/platform/patch_async_ngram_dsc.py`
+   - 移除 `if not hasattr(Scheduler, "_should_enable_spec_decode_for_batch")` 這類「同名方法存在就跳過 patch」的安裝條件。
+   - 改為保存 `Scheduler` 原始 `schedule` 後，固定安裝 Ascend DSC wrapper。
+   - 新增 `_ascend_dsc_patch_applied` marker，避免重覆保存原始 `schedule`。
+   - 在模組載入時輸出一次 warning marker：`Ascend async-ngram DSC patch installed...`。
+2. 將 load report 與 enable/disable 轉換 log 提升到 warning 等級，確保預設日志等級下可觀測。
+
+影響：
+- 在較新 vLLM（已內建同名 scheduler helper）版本也能確定安裝 DSC patch。
+- 可明確從 log 觀察 patch 已掛上、每分鐘 load、以及 enable/disable 切換事件。

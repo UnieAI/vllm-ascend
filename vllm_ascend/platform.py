@@ -17,6 +17,7 @@
 
 import gc
 import os
+import argparse
 from datetime import timedelta
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -42,6 +43,18 @@ else:
     ModelConfig = None
     VllmConfig = None
     FlexibleArgumentParser = None
+
+
+class _SetEnvIntAction(argparse.Action):
+
+    def __init__(self, option_strings, dest, env_name: str, **kwargs):
+        self.env_name = env_name
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        ival = int(values)
+        setattr(namespace, self.dest, ival)
+        os.environ[self.env_name] = str(ival)
 
 
 class NPUPlatform(Platform):
@@ -79,6 +92,46 @@ class NPUPlatform(Platform):
                                         'choices') and quant_action.choices:
                 if ASCEND_QUANTIZATION_METHOD not in quant_action.choices:
                     quant_action.choices.append(ASCEND_QUANTIZATION_METHOD)
+
+            if "--speculative-enable-load" \
+                    not in parser._option_string_actions:
+                parser.add_argument(
+                    "--speculative-enable-load",
+                    type=int,
+                    default=None,
+                    action=_SetEnvIntAction,
+                    env_name="VLLM_ASCEND_SPEC_ENABLE_LOAD",
+                    help=(
+                        "Enable speculative decoding when estimated token load "
+                        "drops below this threshold (Ascend DSC override)."
+                    ),
+                )
+            if "--speculative-disable-load" \
+                    not in parser._option_string_actions:
+                parser.add_argument(
+                    "--speculative-disable-load",
+                    type=int,
+                    default=None,
+                    action=_SetEnvIntAction,
+                    env_name="VLLM_ASCEND_SPEC_DISABLE_LOAD",
+                    help=(
+                        "Disable speculative decoding when estimated token load "
+                        "exceeds this threshold (Ascend DSC override)."
+                    ),
+                )
+            if "--speculative-cooldown-sec" \
+                    not in parser._option_string_actions:
+                parser.add_argument(
+                    "--speculative-cooldown-sec",
+                    type=int,
+                    default=None,
+                    action=_SetEnvIntAction,
+                    env_name="VLLM_ASCEND_SPEC_COOLDOWN_SEC",
+                    help=(
+                        "Minimum seconds between speculative decode on/off "
+                        "switches (Ascend DSC override)."
+                    ),
+                )
 
         from vllm_ascend.quantization.quant_config import \
             AscendQuantConfig  # noqa: F401

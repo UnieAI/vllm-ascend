@@ -794,7 +794,7 @@ def _sample_recovered_tokens_for_indices(
     if is_ngram:
         reject_draft_ids = draft_token_ids[reject_token_idx].to(torch.long)
         if _NGRAM_FAST_RECOVER_ARGMAX:
-            scores = target_slice.to(torch.float32)
+            scores = target_slice
             row_ids = torch.arange(scores.shape[0], device=device)
             scores[row_ids, reject_draft_ids] = float("-inf")
             return torch.argmax(scores, dim=1)
@@ -839,12 +839,14 @@ def _sample_recovered_tokens_from_logits_indices(
     if num_reject == 0:
         return torch.empty((0,), dtype=torch.long, device=device)
 
-    logits_slice = target_logits[reject_token_idx].to(torch.float32)
+    logits_slice = target_logits[reject_token_idx]
     reject_draft_ids = draft_token_ids[reject_token_idx].to(torch.long)
     if _NGRAM_FAST_RECOVER_ARGMAX:
         row_ids = torch.arange(logits_slice.shape[0], device=device)
         logits_slice[row_ids, reject_draft_ids] = float("-inf")
         return torch.argmax(logits_slice, dim=1)
+
+    logits_slice = logits_slice.to(torch.float32)
 
     q = torch.empty(
         (num_reject, vocab_size),

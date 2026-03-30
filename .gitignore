@@ -1,4 +1,6 @@
 ## vLLM Ascend Ignore
+patches*/
+
 # VSCode
 .vscode/
 
